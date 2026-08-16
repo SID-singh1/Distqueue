@@ -1,0 +1,107 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "id": 1,
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "distqueue_queue_depth", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "id": 2,
+      "title": "Delayed Jobs",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "distqueue_delayed_jobs", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "id": 3,
+      "title": "Pending Entries (PEL Size)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "distqueue_pending_entries", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 4,
+      "title": "Throughput (Jobs Completed/sec)",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(distqueue_jobs_completed_total[1m])", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 5,
+      "title": "Job Duration Percentiles",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by(le) (rate(distqueue_job_duration_seconds_bucket[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by(le) (rate(distqueue_job_duration_seconds_bucket[5m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by(le) (rate(distqueue_job_duration_seconds_bucket[5m])))", "legendFormat": "p99", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "id": 6,
+      "title": "Failure Rate by Outcome",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "custom": { "stacking": { "mode": "normal", "group": "A" } } }, "overrides": [] },
+      "targets": [
+        { "expr": "rate(distqueue_jobs_failed_total[1m])", "legendFormat": "{{outcome}}", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "id": 7,
+      "title": "Failure Rate by Trigger",
+      "type": "timeseries",
+      "fieldConfig": { "defaults": { "custom": { "stacking": { "mode": "normal", "group": "A" } } }, "overrides": [] },
+      "targets": [
+        { "expr": "rate(distqueue_jobs_failed_total[1m])", "legendFormat": "{{trigger}}", "refId": "A" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "id": 8,
+      "title": "Jobs Reclaimed by Monitor",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(distqueue_jobs_reclaimed_total[1m])", "refId": "A" }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": [],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Distqueue Metrics",
+  "uid": "distqueue-metrics-1",
+  "version": 1
+}

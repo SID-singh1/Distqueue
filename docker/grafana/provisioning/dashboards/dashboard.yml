@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: 'default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      # Grafana will auto-load any dashboard JSON files from this mounted directory, 
+      # rather than requiring manual import through the UI.
+      path: /var/lib/grafana/dashboards

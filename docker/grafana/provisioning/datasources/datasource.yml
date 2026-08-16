@@ -1,0 +1,12 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    # Grafana runs in its own container, so localhost from its perspective 
+    # means itself, not the host machine or the Prometheus container.
+    # Therefore, we use the Docker-network hostname "prometheus".
+    url: http://prometheus:9090
+    isDefault: true
