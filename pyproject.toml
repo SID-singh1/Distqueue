@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "distqueue"
+version = "0.1.0"
+description = "A Redis-backed distributed job queue and task scheduler, built from scratch."
+requires-python = ">=3.11"
+dependencies = [
+    # redis-py ≥5.0 is required for native Streams commands (XADD, XREADGROUP,
+    # XACK, XAUTOCLAIM, etc.) without falling back to execute_command().
+    "redis>=5.0",
+    # Prometheus client library for exposing /metrics HTTP endpoint.
+    # Workers, scheduler, and monitor each run start_http_server() on
+    # METRICS_PORT; Prometheus scrapes them on an interval.
+    "prometheus_client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    # pytest-asyncio isn't needed yet — nothing is async in the first scaffold.
+    # We'll add it when async enters the picture.
+]
+
+# Let setuptools auto-discover the distqueue package.
+[tool.setuptools.packages.find]
+include = ["distqueue*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    # Integration tests hit a real Redis instance and are slower / require
+    # Docker.  Registering the marker here suppresses pytest's
+    # "PytestUnknownMarkWarning" and makes `pytest -m "not integration"`
+    # a clean, warning-free way to run only unit tests.
+    "integration: tests that require a running Redis instance (docker compose up)",
+]

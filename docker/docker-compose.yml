@@ -1,0 +1,82 @@
+# docker-compose.yml — distqueue application stack.
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: python scripts/run_worker.py
+    # We use expose instead of ports because docker compose --scale worker=N 
+    # would fail if we bound multiple containers to the same host port. 
+    # 'expose' makes the port accessible only within the Docker network 
+    # (e.g., to Prometheus), allowing horizontal scaling without port conflicts.
+    expose:
+      - "9100"
+    environment:
+      - REDIS_HOST=redis
+      - DEMO_FAILURE_RATE=0.1
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: python scripts/run_scheduler.py
+    expose:
+      - "9100"
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Scheduler is single-replica by design
+
+  monitor:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: python scripts/run_monitor.py
+    expose:
+      - "9100"
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      # Fine to publish host port since there is only ever one Grafana instance
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Enabling anonymous access is fine for a local portfolio demo to avoid 
+      # constant logins, but this would never be done in production.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
