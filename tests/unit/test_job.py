@@ -14,8 +14,8 @@ import time
 
 import pytest
 
-from distqueue.job import Job
-
+from distqueue import config
+from distqueue.job import TERMINAL_STATUSES, Job, JobStatus
 
 # ---------------------------------------------------------------------------
 # Round-trip tests
@@ -46,10 +46,12 @@ class TestJobRoundTrip:
         now = time.time()
         original = Job(
             id="abc123",
+            queue="emails",
             payload={"url": "https://example.com", "retries": 3},
             status="RUNNING",
             attempts=2,
             max_attempts=10,
+            timeout_s=45.5,
             created_at=now - 60,
             updated_at=now,
             next_retry_at=now + 30,
@@ -59,10 +61,12 @@ class TestJobRoundTrip:
         rebuilt = Job.from_redis_hash(original.to_redis_hash())
 
         assert rebuilt.id == original.id
+        assert rebuilt.queue == "emails"
         assert rebuilt.payload == original.payload
         assert rebuilt.status == original.status
         assert rebuilt.attempts == original.attempts
         assert rebuilt.max_attempts == original.max_attempts
+        assert rebuilt.timeout_s == 45.5
         assert rebuilt.created_at == original.created_at
         assert rebuilt.updated_at == original.updated_at
         assert rebuilt.next_retry_at == pytest.approx(original.next_retry_at)
@@ -99,7 +103,9 @@ class TestToRedisHash:
         )
         h = job.to_redis_hash()
         for key, value in h.items():
-            assert isinstance(value, str), f"Field {key!r} is {type(value)}, expected str"
+            assert isinstance(value, str), (
+                f"Field {key!r} is {type(value)}, expected str"
+            )
 
     def test_none_fields_become_empty_strings(self) -> None:
         """Optional fields that are None should serialize as '' (empty string),
@@ -180,3 +186,45 @@ class TestJobDefaults:
         after = time.time()
         assert before <= job.created_at <= after
         assert before <= job.updated_at <= after
+
+
+# ---------------------------------------------------------------------------
+# Backward compatibility and corrupt records
+# ---------------------------------------------------------------------------
+
+
+class TestCompatibility:
+    """Hashes written by an older version of the code must still load."""
+
+    def test_hash_without_queue_and_timeout_uses_defaults(self) -> None:
+        """v0.1 hashes had no queue/timeout_s fields.  During a rolling
+        upgrade, new workers will read them; they must not crash."""
+        h = Job().to_redis_hash()
+        del h["queue"]
+        del h["timeout_s"]
+        rebuilt = Job.from_redis_hash(h)
+        assert rebuilt.queue == config.DEFAULT_QUEUE
+        assert rebuilt.timeout_s == config.DEFAULT_JOB_TIMEOUT_S
+
+    def test_missing_required_field_raises_key_error(self) -> None:
+        """A stub hash (e.g. only next_retry_at) must raise, not half-load.
+
+        Callers catch this and dead-letter the job as corrupt.
+        """
+        with pytest.raises(KeyError):
+            Job.from_redis_hash({"next_retry_at": ""})
+
+    def test_invalid_payload_json_raises_value_error(self) -> None:
+        h = Job().to_redis_hash()
+        h["payload"] = "{not json"
+        with pytest.raises(ValueError):
+            Job.from_redis_hash(h)
+
+
+class TestJobStatus:
+    def test_values_serialise_as_plain_strings(self) -> None:
+        """Lua scripts compare against literal 'COMPLETED' / 'DEAD'."""
+        assert Job(status=JobStatus.COMPLETED).to_redis_hash()["status"] == "COMPLETED"
+
+    def test_terminal_statuses(self) -> None:
+        assert {"COMPLETED", "DEAD"} == set(TERMINAL_STATUSES)

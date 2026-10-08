@@ -4,25 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "distqueue"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Redis-backed distributed job queue and task scheduler, built from scratch."
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     # redis-py ≥5.0 is required for native Streams commands (XADD, XREADGROUP,
-    # XACK, XAUTOCLAIM, etc.) without falling back to execute_command().
+    # XACK, XCLAIM, XINFO, etc.) without falling back to execute_command().
     "redis>=5.0",
-    # Prometheus client library for exposing /metrics HTTP endpoint.
-    # Workers, scheduler, and monitor each run start_http_server() on
-    # METRICS_PORT; Prometheus scrapes them on an interval.
+    # Prometheus client library for exposing the /metrics HTTP endpoint.
     "prometheus_client>=0.20",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
-    # pytest-asyncio isn't needed yet — nothing is async in the first scaffold.
-    # We'll add it when async enters the picture.
+    # Coverage reporting in CI (pytest --cov).
+    "pytest-cov>=4.0",
+    # Linter + formatter.  One tool instead of flake8 + isort + black.
+    "ruff>=0.6",
 ]
+chaos = [
+    # The chaos scripts find, kill and pause worker containers through the
+    # Docker Engine API.
+    "docker>=7.0",
+]
+
+# `pip install .` puts a `distqueue` command on PATH.  Containers run
+# `distqueue worker` / `distqueue scheduler` / ... instead of
+# `python scripts/run_*.py`, which needed sys.path hacks to find the package.
+[project.scripts]
+distqueue = "distqueue.cli:main"
 
 # Let setuptools auto-discover the distqueue package.
 [tool.setuptools.packages.find]
@@ -31,9 +43,40 @@ include = ["distqueue*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    # Integration tests hit a real Redis instance and are slower / require
-    # Docker.  Registering the marker here suppresses pytest's
-    # "PytestUnknownMarkWarning" and makes `pytest -m "not integration"`
-    # a clean, warning-free way to run only unit tests.
-    "integration: tests that require a running Redis instance (docker compose up)",
+    # Integration tests hit a real Redis instance.  `pytest -m "not integration"`
+    # runs only the fast unit tests.
+    "integration: tests that require a running Redis instance",
 ]
+
+[tool.coverage.run]
+source = ["distqueue"]
+# cli.py and entrypoints.py are process wiring (argparse, signal handlers,
+# start_http_server) exercised by the Docker stack and chaos tests rather
+# than by pytest.
+omit = ["distqueue/entrypoints.py"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+# Pinned explicitly so local runs and CI agree regardless of the ruff
+# version's default rule set.
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # import sorting
+    "B",    # bugbear: likely bugs
+    "UP",   # pyupgrade: modern syntax for the target Python
+    "BLE",  # blind except: every `except Exception` must justify itself
+    "C4",   # comprehension simplifications
+    "RUF",  # ruff-specific checks (incl. unused noqa)
+]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # unicode arrows/dashes in comments are intentional
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately raise/catch broad exceptions to simulate failures.
+"tests/**" = ["BLE001", "B017"]

@@ -33,3 +33,11 @@ coverage.xml
 
 # ----- Environment variables (may contain secrets later) -----
 .env
+
+# ----- Local Interview / Study Notes -----
+DISTQUEUE_INTERVIEW_GUIDE.md
+DISTQUEUE_INTERVIEW_GUIDE.html
+
+
+# notes for my references
+notes_for_my_reference.txt

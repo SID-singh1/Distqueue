@@ -1,321 +1,362 @@
 """
 test_monitor.py — Integration tests for distqueue.monitor.Monitor.
 
-These tests require a running Redis instance.  Start one with:
-
-    docker compose -f docker/docker-compose.yml up -d
-
-Tests simulate dead workers directly by manually placing entries into the
-PEL (via XADD → XREADGROUP under a fake consumer name, without creating a
-heartbeat key).  This avoids spinning up a real Worker thread and killing
-it — that's what the chaos test (a later milestone) will do.
-
-All tests are marked with @pytest.mark.integration.
+Dead workers are simulated by delivering an entry to a fake consumer name
+that has no heartbeat key (see helpers.simulate_dead_worker); the real
+kill-a-container version lives in chaos/.
 """
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
 
 from distqueue import config
-from distqueue.job import Job
+from distqueue.job import Job, JobStatus
 from distqueue.monitor import Monitor
+from distqueue.producer import enqueue
+from distqueue.stats import queue_stats
+from distqueue.worker import Worker
+from tests.integration.helpers import (
+    deliver,
+    ensure_group,
+    sample,
+    seed_job,
+    set_heartbeat,
+    simulate_dead_worker,
+)
 
-
-# Apply the integration marker to every test in this module.
 pytestmark = pytest.mark.integration
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _job(client, job_id: str) -> Job:
+    return Job.from_redis_hash(client.hgetall(config.job_key(job_id)))
 
 
-def _setup_stream_and_group(redis_client) -> None:
-    """Create the main stream and consumer group if they don't exist.
-
-    Uses MKSTREAM so the stream is auto-created.  Catches BUSYGROUP
-    if the group already exists (idempotent across tests).
-    """
-    try:
-        redis_client.xgroup_create(
-            config.QUEUE_NAME,
-            config.CONSUMER_GROUP,
-            id="0",
-            mkstream=True,
-        )
-    except Exception as e:
-        if "BUSYGROUP" not in str(e):
-            raise
+def _pending(client, queue: str = "default") -> int:
+    return client.xpending(config.stream_key(queue), config.CONSUMER_GROUP)["pending"]
 
 
-def _simulate_dead_worker(
-    redis_client,
-    job_id: str,
-    consumer_name: str,
-    max_attempts: int = 3,
-    attempts: int = 0,
-) -> str:
-    """Place a job into the PEL under a fake consumer with no heartbeat.
-
-    This simulates the state left behind when a worker crashes:
-      - The job hash exists in Redis (with the given attempts/max_attempts)
-      - A stream entry exists pointing to the job
-      - The entry is in the PEL, owned by consumer_name (via XREADGROUP)
-      - No heartbeat key exists for consumer_name
-
-    Returns the stream entry ID.
-    """
-    # Create the job hash.
-    job = Job(
-        id=job_id,
-        payload={"task": "orphaned"},
-        status="RUNNING",
-        attempts=attempts,
-        max_attempts=max_attempts,
-        last_worker=consumer_name,
-    )
-    hash_key = f"{config.JOB_HASH_KEY_PREFIX}{job_id}"
-    redis_client.hset(hash_key, mapping=job.to_redis_hash())
-
-    # Add to stream.
-    entry_id = redis_client.xadd(config.QUEUE_NAME, {"job_id": job_id})
-
-    # XREADGROUP under the fake consumer to put the entry in the PEL.
-    # This is how entries get into the PEL in production — XREADGROUP
-    # delivers the message and adds it to the consumer's pending list.
-    redis_client.xreadgroup(
+def _owner(client, entry_id: str, queue: str = "default") -> str | None:
+    rows = client.xpending_range(
+        config.stream_key(queue),
         config.CONSUMER_GROUP,
-        consumer_name,
-        {config.QUEUE_NAME: ">"},
+        min=entry_id,
+        max=entry_id,
         count=1,
     )
-
-    return entry_id
+    return rows[0]["consumer"] if rows else None
 
 
 # ---------------------------------------------------------------------------
-# Dead worker → retry path
+# Reclaiming from dead workers
 # ---------------------------------------------------------------------------
 
 
-class TestMonitorReclaimRetry:
-    """Verify that the monitor reclaims a job from a dead worker and
-    schedules it for retry when attempts remain."""
+class TestDeadWorker:
+    def test_dead_worker_job_is_retried(self, redis_client) -> None:
+        simulate_dead_worker(redis_client, "r-1", "dead-1", max_attempts=3)
 
-    def test_dead_worker_job_retried(self, redis_client) -> None:
-        """A job in the PEL whose worker has no heartbeat should be
-        reclaimed: attempts incremented, status PENDING, placed in the
-        delayed ZSet, and last_error mentions the dead worker."""
-        _setup_stream_and_group(redis_client)
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 1
 
-        job_id = "reclaim-retry-001"
-        consumer = "dead-worker-retry-1"
+        job = _job(redis_client, "r-1")
+        assert (job.status, job.attempts) == (JobStatus.PENDING, 1)
+        assert "dead-1" in job.last_error and "heartbeat expired" in job.last_error
+        assert redis_client.zscore(config.DELAYED_ZSET, "r-1") is not None
+        assert _pending(redis_client) == 0
 
-        _simulate_dead_worker(
-            redis_client,
-            job_id=job_id,
-            consumer_name=consumer,
-            max_attempts=3,
-            attempts=0,
-        )
+    def test_dead_worker_job_at_max_attempts_is_dead_lettered(
+        self, redis_client
+    ) -> None:
+        simulate_dead_worker(redis_client, "d-1", "dead-2", max_attempts=1)
 
-        # min_idle_ms=0 so we don't need to wait for the entry to age.
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 1
+
+        assert _job(redis_client, "d-1").status == JobStatus.DEAD
+        [(_, fields)] = redis_client.xrange(config.DLQ_STREAM)
+        assert fields["job_id"] == "d-1"
+        assert fields["trigger"] == "worker_death"
+        assert _pending(redis_client) == 0
+
+    def test_alive_worker_is_left_alone(self, redis_client) -> None:
+        simulate_dead_worker(redis_client, "a-1", "slow-but-alive")
+        set_heartbeat(redis_client, "slow-but-alive")
+
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 0
+
+        job = _job(redis_client, "a-1")
+        assert (job.status, job.attempts) == (JobStatus.RUNNING, 0)
+        assert _pending(redis_client) == 1
+
+    def test_recently_delivered_entry_is_not_considered(self, redis_client) -> None:
+        simulate_dead_worker(redis_client, "fresh-1", "just-crashed")
+        assert Monitor(redis_client, min_idle_ms=60_000).tick() == 0
+        assert _pending(redis_client) == 1
+
+    def test_empty_pel(self, redis_client) -> None:
+        ensure_group(redis_client)
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 0
+
+    def test_queue_without_group_is_skipped(self, redis_client) -> None:
+        """A queue nobody has consumed yet has no group; NOGROUP must not
+        crash the tick."""
+        enqueue(redis_client, {}, queue="nobody-listens")
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 0
+
+    def test_terminal_job_entry_is_acked_not_failed(self, redis_client) -> None:
+        """A stale entry for a COMPLETED job must not drag it back to PENDING."""
+        seed_job(redis_client, Job(id="t-1", status=JobStatus.COMPLETED))
+        deliver(redis_client, "t-1", "dead-3")
+
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 0
+
+        assert _job(redis_client, "t-1").status == JobStatus.COMPLETED
+        assert _pending(redis_client) == 0
+
+    def test_corrupt_hash_is_dead_lettered_and_monitor_survives(
+        self, redis_client
+    ) -> None:
+        """Previously Job.from_redis_hash raised out of tick(), crashing the
+        monitor — and on restart it hit the same entry again, forever."""
+        redis_client.hset(config.job_key("bad"), mapping={"next_retry_at": ""})
+        deliver(redis_client, "bad", "dead-4")
         monitor = Monitor(redis_client, min_idle_ms=0)
-        reclaimed = monitor.tick()
 
-        assert reclaimed == 1
+        monitor.tick()
+        monitor.tick()
 
-        # Verify job state.
-        raw = redis_client.hgetall(f"{config.JOB_HASH_KEY_PREFIX}{job_id}")
-        job = Job.from_redis_hash(raw)
+        [(_, fields)] = redis_client.xrange(config.DLQ_STREAM)
+        assert fields["trigger"] == "corrupt"
+        assert _pending(redis_client) == 0
 
-        assert job.attempts == 1
-        assert job.status == "PENDING"
-        assert consumer in job.last_error
-        assert "heartbeat expired" in job.last_error
-
-        # Job should be in the delayed ZSet (scheduled for retry).
-        score = redis_client.zscore(config.DELAYED_ZSET, job_id)
-        assert score is not None
-
-        # Original PEL entry should be acked (pending count = 0).
-        pending_info = redis_client.xpending(
-            config.QUEUE_NAME, config.CONSUMER_GROUP
+    def test_reclaim_metrics(self, redis_client) -> None:
+        simulate_dead_worker(redis_client, "m-1", "dead-5")
+        reclaimed = sample(
+            "distqueue_jobs_reclaimed_total", queue="default", reason="worker_death"
         )
-        assert pending_info["pending"] == 0
-
-
-# ---------------------------------------------------------------------------
-# Dead worker → DLQ path
-# ---------------------------------------------------------------------------
-
-
-class TestMonitorReclaimDLQ:
-    """Verify that the monitor sends a reclaimed job to the DLQ when
-    no retry attempts remain."""
-
-    def test_dead_worker_job_dlq(self, redis_client) -> None:
-        """A job at max_attempts=1 with attempts=0, reclaimed from a
-        dead worker, should end up DEAD in the DLQ (not retried)."""
-        _setup_stream_and_group(redis_client)
-
-        job_id = "reclaim-dlq-001"
-        consumer = "dead-worker-dlq-1"
-
-        _simulate_dead_worker(
-            redis_client,
-            job_id=job_id,
-            consumer_name=consumer,
-            max_attempts=1,
-            attempts=0,
+        failed = sample(
+            "distqueue_jobs_failed_total",
+            queue="default",
+            outcome="retried",
+            trigger="worker_death",
         )
 
-        monitor = Monitor(redis_client, min_idle_ms=0)
-        reclaimed = monitor.tick()
+        Monitor(redis_client, min_idle_ms=0).tick()
 
-        assert reclaimed == 1
-
-        # Verify job state.
-        raw = redis_client.hgetall(f"{config.JOB_HASH_KEY_PREFIX}{job_id}")
-        job = Job.from_redis_hash(raw)
-
-        assert job.attempts == 1
-        assert job.status == "DEAD"
-        assert consumer in job.last_error
-
-        # Job should be in the DLQ.
-        dlq_entries = redis_client.xrange(config.DLQ_STREAM)
-        assert len(dlq_entries) == 1
-        _msg_id, fields = dlq_entries[0]
-        assert fields["job_id"] == job_id
-        assert "heartbeat expired" in fields["reason"]
-
-        # PEL should be clear.
-        pending_info = redis_client.xpending(
-            config.QUEUE_NAME, config.CONSUMER_GROUP
+        assert (
+            sample(
+                "distqueue_jobs_reclaimed_total", queue="default", reason="worker_death"
+            )
+            - reclaimed
+            == 1
         )
-        assert pending_info["pending"] == 0
-
-
-# ---------------------------------------------------------------------------
-# Alive worker — heartbeat prevents reclamation
-# ---------------------------------------------------------------------------
-
-
-class TestMonitorSkipsAliveWorker:
-    """Verify that the monitor does NOT reclaim from a worker whose
-    heartbeat is still active — the worker is just slow, not dead."""
-
-    def test_alive_worker_not_reclaimed(self, redis_client) -> None:
-        """A PEL entry owned by a worker with a valid heartbeat should
-        NOT be reclaimed.  tick() should return 0, attempts unchanged."""
-        _setup_stream_and_group(redis_client)
-
-        job_id = "alive-worker-001"
-        consumer = "slow-but-alive-1"
-
-        _simulate_dead_worker(
-            redis_client,
-            job_id=job_id,
-            consumer_name=consumer,
-            max_attempts=3,
-            attempts=0,
+        assert (
+            sample(
+                "distqueue_jobs_failed_total",
+                queue="default",
+                outcome="retried",
+                trigger="worker_death",
+            )
+            - failed
+            == 1
         )
 
-        # Now CREATE a heartbeat key for this consumer — simulating a
-        # worker that's alive and just running a long handler.
-        heartbeat_key = (
-            f"{config.WORKER_HEARTBEAT_KEY_PREFIX}"
-            f"{consumer}"
-            f"{config.WORKER_HEARTBEAT_KEY_SUFFIX}"
-        )
-        redis_client.set(
-            heartbeat_key, str(time.time()), ex=config.HEARTBEAT_TTL_S
-        )
-
-        monitor = Monitor(redis_client, min_idle_ms=0)
-        reclaimed = monitor.tick()
-
-        assert reclaimed == 0
-
-        # Job should be untouched — still attempts=0, status=RUNNING.
-        raw = redis_client.hgetall(f"{config.JOB_HASH_KEY_PREFIX}{job_id}")
-        job = Job.from_redis_hash(raw)
-
-        assert job.attempts == 0
-        assert job.status == "RUNNING"
-
-        # PEL should still have the entry (not acked).
-        pending_info = redis_client.xpending(
-            config.QUEUE_NAME, config.CONSUMER_GROUP
-        )
-        assert pending_info["pending"] == 1
-
 
 # ---------------------------------------------------------------------------
-# Empty PEL
+# Claim precision and concurrency
 # ---------------------------------------------------------------------------
 
 
-class TestMonitorEmptyPEL:
-    """Verify tick() returns 0 when there are no pending entries."""
+class TestClaimPrecision:
+    def test_already_claimed_entry_does_not_spill_onto_neighbour(
+        self, redis_client
+    ) -> None:
+        """Regression test for the XAUTOCLAIM bug.
 
-    def test_empty_pel_returns_zero(self, redis_client) -> None:
-        """With nothing in the PEL, tick() should return 0 immediately."""
-        _setup_stream_and_group(redis_client)
+        Setup: E1 belongs to a dead worker; E2, right after it, to a live
+        worker on a long job.  Monitor B reclaims E1 first (its idle time
+        resets).  Monitor A then tries to reclaim E1 from its now-stale
+        XPENDING snapshot.
 
-        monitor = Monitor(redis_client, min_idle_ms=0)
-        reclaimed = monitor.tick()
-
-        assert reclaimed == 0
-
-
-# ---------------------------------------------------------------------------
-# min_idle_ms threshold respected
-# ---------------------------------------------------------------------------
-
-
-class TestMonitorIdleThreshold:
-    """Verify that entries idle for less than min_idle_ms are not
-    reclaimed, even if the worker's heartbeat is absent."""
-
-    def test_recently_idle_entry_not_reclaimed(self, redis_client) -> None:
-        """An entry that was just delivered (idle time near 0) should
-        NOT be reclaimed even if the worker has no heartbeat, when
-        min_idle_ms is set high.
-
-        This tests the XPENDING IDLE pre-filter: entries below the
-        idle threshold never even reach the heartbeat check.
+        Old code — XAUTOCLAIM(start=E1, count=1) — skipped the no-longer-idle
+        E1 and claimed E2, stealing a live worker's job.  XCLAIM on the exact
+        id returns nothing instead.
         """
-        _setup_stream_and_group(redis_client)
+        simulate_dead_worker(redis_client, "e1", "dead-worker")
+        e2 = simulate_dead_worker(redis_client, "e2", "alive-worker")
+        set_heartbeat(redis_client, "alive-worker")
+        time.sleep(0.3)  # both entries now idle ~300 ms
 
-        job_id = "fresh-entry-001"
-        consumer = "just-crashed-1"
+        e1 = redis_client.xrange(config.QUEUE_NAME)[0][0]
+        monitor_b = Monitor(redis_client, min_idle_ms=200)
+        assert monitor_b.tick() == 1  # B reclaims E1
 
-        _simulate_dead_worker(
-            redis_client,
-            job_id=job_id,
-            consumer_name=consumer,
-            max_attempts=3,
+        monitor_a = Monitor(redis_client, min_idle_ms=200)
+        assert (
+            monitor_a._reclaim_entry("default", e1, 200, "stale view", "worker_death")
+            is False
         )
 
-        # Set min_idle_ms very high — the entry was just created, so its
-        # idle time is near 0ms, well below 60 000ms.
-        monitor = Monitor(redis_client, min_idle_ms=60_000)
-        reclaimed = monitor.tick()
-
-        assert reclaimed == 0
-
-        # Job should be untouched.
-        raw = redis_client.hgetall(f"{config.JOB_HASH_KEY_PREFIX}{job_id}")
-        job = Job.from_redis_hash(raw)
-        assert job.attempts == 0
-
-        # PEL should still hold the entry.
-        pending_info = redis_client.xpending(
-            config.QUEUE_NAME, config.CONSUMER_GROUP
+        assert _owner(redis_client, e2) == "alive-worker", (
+            "live worker's job was stolen"
         )
-        assert pending_info["pending"] == 1
+        assert _job(redis_client, "e2").attempts == 0
+
+    def test_concurrent_monitors_reclaim_each_job_once(
+        self, redis_client, make_client
+    ) -> None:
+        n = 40
+        for i in range(n):
+            simulate_dead_worker(
+                redis_client, f"cm-{i}", f"dead-{i % 4}", max_attempts=5
+            )
+
+        monitors = [Monitor(make_client(), min_idle_ms=0) for _ in range(3)]
+        totals: list[int] = []
+        lock = threading.Lock()
+
+        def run(m: Monitor) -> None:
+            count = sum(m.tick() for _ in range(3))
+            with lock:
+                totals.append(count)
+
+        threads = [threading.Thread(target=run, args=(m,)) for m in monitors]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert sum(totals) == n
+        assert all(_job(redis_client, f"cm-{i}").attempts == 1 for i in range(n))
+        assert redis_client.zcard(config.DELAYED_ZSET) == n
+
+    def test_cursor_reaches_entries_past_the_first_page(self, redis_client) -> None:
+        """Regression test: the PEL scan always restarted at "-", so if the
+        first page was all live workers' long jobs, dead workers' entries
+        behind them were never examined."""
+        for i in range(4):
+            simulate_dead_worker(redis_client, f"busy-{i}", f"alive-{i}")
+            set_heartbeat(redis_client, f"alive-{i}")
+        simulate_dead_worker(redis_client, "behind", "dead-behind")
+
+        monitor = Monitor(redis_client, min_idle_ms=0, scan_count=2)
+        reclaimed = sum(monitor.tick() for _ in range(3))
+
+        assert reclaimed == 1
+        assert _job(redis_client, "behind").attempts == 1
+
+
+# ---------------------------------------------------------------------------
+# Timeouts
+# ---------------------------------------------------------------------------
+
+
+class TestTimeouts:
+    def test_job_past_timeout_is_reclaimed_from_live_worker(self, redis_client) -> None:
+        simulate_dead_worker(redis_client, "slow-1", "alive-slow", timeout_s=0.2)
+        set_heartbeat(redis_client, "alive-slow")
+        time.sleep(0.3)
+
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 1
+
+        job = _job(redis_client, "slow-1")
+        assert job.attempts == 1
+        assert "exceeded timeout" in job.last_error
+
+    def test_job_within_timeout_is_left_alone(self, redis_client) -> None:
+        simulate_dead_worker(redis_client, "ok-1", "alive-ok", timeout_s=60)
+        set_heartbeat(redis_client, "alive-ok")
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 0
+
+    def test_zero_timeout_disables_the_limit(self, redis_client) -> None:
+        simulate_dead_worker(redis_client, "inf-1", "alive-inf", timeout_s=0)
+        set_heartbeat(redis_client, "alive-inf")
+        time.sleep(0.1)
+        assert Monitor(redis_client, min_idle_ms=0).tick() == 0
+
+
+# ---------------------------------------------------------------------------
+# Housekeeping: trimming, consumer GC, gauges
+# ---------------------------------------------------------------------------
+
+
+class TestTrimming:
+    def test_trim_drops_only_finished_entries(self, redis_client) -> None:
+        """Acked entries go; pending and undelivered entries stay."""
+        worker = Worker(redis_client, lambda p: None, block_ms=100)
+        done = [enqueue(redis_client, {}) for _ in range(5)]
+        for _ in done:
+            worker.process_one()
+        simulate_dead_worker(redis_client, "inflight", "holder")
+        set_heartbeat(redis_client, "holder")
+        enqueue(redis_client, {})  # undelivered
+        assert redis_client.xlen(config.QUEUE_NAME) == 7
+
+        removed = Monitor(redis_client, min_idle_ms=0, approximate_trim=False).trim(
+            "default"
+        )
+
+        assert removed == 5
+        assert redis_client.xlen(config.QUEUE_NAME) == 2
+        assert _pending(redis_client) == 1
+
+    def test_backlog_stays_correct_after_trimming(self, redis_client) -> None:
+        """Backlog comes from the group's lag, which must survive XTRIM."""
+        worker = Worker(redis_client, lambda p: None, block_ms=100)
+        for _ in range(4):
+            enqueue(redis_client, {})
+        worker.process_one()
+        worker.process_one()
+
+        Monitor(redis_client, min_idle_ms=0, approximate_trim=False).trim("default")
+        stats = queue_stats(redis_client, "default")
+
+        assert stats.backlog == 2
+        assert stats.pending == 0
+        assert stats.stream_length == 2
+
+    def test_nothing_trimmed_before_any_delivery(self, redis_client) -> None:
+        ensure_group(redis_client)
+        enqueue(redis_client, {})
+        monitor = Monitor(redis_client, min_idle_ms=0, approximate_trim=False)
+        assert monitor.trim("default") == 0
+        assert redis_client.xlen(config.QUEUE_NAME) == 1
+
+
+class TestConsumerGC:
+    def test_idle_dead_consumer_removed_live_and_busy_kept(self, redis_client) -> None:
+        ensure_group(redis_client)
+        stream = config.QUEUE_NAME
+        for name in ("ghost", "alive"):
+            redis_client.xgroup_createconsumer(stream, "workers", name)
+        set_heartbeat(redis_client, "alive")
+        simulate_dead_worker(redis_client, "held", "busy-ghost")
+
+        live = Monitor(redis_client, consumer_gc_idle_ms=0).collect_consumers("default")
+
+        names = {c["name"] for c in redis_client.xinfo_consumers(stream, "workers")}
+        assert "ghost" not in names
+        assert {"alive", "busy-ghost"} <= names, "never delete a consumer with pending"
+        assert live == {"alive"}
+
+
+class TestGauges:
+    def test_tick_publishes_queue_state(self, redis_client) -> None:
+        # Deliver first: deliver() hands out the *next undelivered* entry.
+        simulate_dead_worker(redis_client, "g-1", "alive-g")
+        set_heartbeat(redis_client, "alive-g")
+        for _ in range(3):
+            enqueue(redis_client, {})
+        enqueue(redis_client, {}, delay_s=3600)
+        redis_client.xadd(config.DLQ_STREAM, {"job_id": "x"})
+
+        Monitor(redis_client, min_idle_ms=60_000).tick()
+
+        # Backlog = the 3 undelivered entries; g-1 is pending, not backlog.
+        assert sample("distqueue_queue_backlog", queue="default") == 3
+        assert sample("distqueue_pending_entries", queue="default") == 1
+        assert sample("distqueue_delayed_jobs") == 1
+        assert sample("distqueue_dlq_depth") == 1
+        assert sample("distqueue_live_workers") == 1

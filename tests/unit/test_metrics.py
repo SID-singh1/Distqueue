@@ -1,87 +1,85 @@
 """
 test_metrics.py — Unit tests for distqueue.metrics.
 
-These tests verify that all metric objects are correctly defined with the
-expected names, types, and label sets.  No Redis needed — these test the
-metrics module in isolation against the prometheus_client registry.
+These assert on what Prometheus actually scrapes — the text exposition
+format produced by generate_latest() — rather than on prometheus_client
+private attributes (_name, _labelnames, _upper_bounds).  The previous
+version of this file checked _upper_bounds directly, so changing the
+buckets broke a test that wasn't testing anything a scraper could see.
 """
 
 from __future__ import annotations
 
 import pytest
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import REGISTRY, generate_latest
 
 from distqueue import metrics
 
 
-class TestMetricDefinitions:
-    """Verify each metric object exists with the expected name and type."""
-
-    def test_jobs_enqueued_is_counter(self) -> None:
-        assert isinstance(metrics.JOBS_ENQUEUED, Counter)
-        # _name is the internal prometheus_client attribute.  For counters,
-        # the library stores it WITHOUT the _total suffix — _total is
-        # auto-appended during serialisation to the /metrics endpoint.
-        assert metrics.JOBS_ENQUEUED._name == "distqueue_jobs_enqueued"
-
-    def test_jobs_completed_is_counter(self) -> None:
-        assert isinstance(metrics.JOBS_COMPLETED, Counter)
-        assert metrics.JOBS_COMPLETED._name == "distqueue_jobs_completed"
-
-    def test_jobs_failed_is_counter(self) -> None:
-        assert isinstance(metrics.JOBS_FAILED, Counter)
-        assert metrics.JOBS_FAILED._name == "distqueue_jobs_failed"
-
-    def test_jobs_failed_has_expected_labels(self) -> None:
-        assert metrics.JOBS_FAILED._labelnames == ("queue", "outcome", "trigger")
-
-    def test_jobs_reclaimed_is_counter(self) -> None:
-        assert isinstance(metrics.JOBS_RECLAIMED, Counter)
-        assert metrics.JOBS_RECLAIMED._name == "distqueue_jobs_reclaimed"
-
-    def test_job_duration_is_histogram(self) -> None:
-        assert isinstance(metrics.JOBS_DURATION, Histogram)
-        assert metrics.JOBS_DURATION._name == "distqueue_job_duration_seconds"
-
-    def test_job_duration_has_expected_buckets(self) -> None:
-        # _upper_bounds is a list that includes the implicit +Inf bucket.
-        expected = [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, float("inf")]
-        assert metrics.JOBS_DURATION._upper_bounds == expected
-
-    def test_queue_depth_is_gauge(self) -> None:
-        assert isinstance(metrics.QUEUE_DEPTH, Gauge)
-        assert metrics.QUEUE_DEPTH._name == "distqueue_queue_depth"
-
-    def test_delayed_jobs_is_gauge(self) -> None:
-        assert isinstance(metrics.DELAYED_JOBS, Gauge)
-        assert metrics.DELAYED_JOBS._name == "distqueue_delayed_jobs"
-
-    def test_pending_entries_is_gauge(self) -> None:
-        assert isinstance(metrics.PENDING_ENTRIES, Gauge)
-        assert metrics.PENDING_ENTRIES._name == "distqueue_pending_entries"
+def _exposition() -> str:
+    return generate_latest(REGISTRY).decode()
 
 
-class TestMetricsServer:
-    """Verify start_metrics_server doesn't raise on a valid port."""
+EXPECTED_TYPES = {
+    "distqueue_jobs_enqueued_total": "counter",
+    "distqueue_jobs_deduplicated_total": "counter",
+    "distqueue_jobs_completed_total": "counter",
+    "distqueue_jobs_failed_total": "counter",
+    "distqueue_jobs_reclaimed_total": "counter",
+    "distqueue_jobs_skipped_total": "counter",
+    "distqueue_lease_lost_total": "counter",
+    "distqueue_scheduler_jobs_moved_total": "counter",
+    "distqueue_scheduler_orphans_dropped_total": "counter",
+    "distqueue_heartbeat_failures_total": "counter",
+    "distqueue_redis_errors_total": "counter",
+    "distqueue_job_duration_seconds": "histogram",
+    "distqueue_job_queue_wait_seconds": "histogram",
+    "distqueue_job_end_to_end_seconds": "histogram",
+    "distqueue_queue_backlog": "gauge",
+    "distqueue_pending_entries": "gauge",
+    "distqueue_stream_length": "gauge",
+    "distqueue_delayed_jobs": "gauge",
+    "distqueue_dlq_depth": "gauge",
+    "distqueue_live_workers": "gauge",
+}
 
-    def test_start_metrics_server_callable(self) -> None:
-        """start_metrics_server should be callable without raising.
 
-        We use a high, unlikely-to-collide test port (39187) to avoid
-        binding conflicts with other services.  However, if a previous
-        test run in the same pytest session already bound this port
-        (prometheus_client reuses the global registry and its HTTP server
-        is a singleton per port), we'll get an "address already in use"
-        OSError.  We treat this specific error as acceptable rather than
-        silently swallowing all exceptions — the test still proves the
-        function is importable and callable.
-        """
-        try:
-            metrics.start_metrics_server(port=39187)
-        except OSError as exc:
-            if "address already in use" in str(exc).lower():
-                # Already bound by a previous test run in the same session.
-                # This is expected and acceptable.
-                pytest.skip("Metrics server port already bound from prior test")
-            else:
-                raise
+@pytest.mark.parametrize(("name", "kind"), sorted(EXPECTED_TYPES.items()))
+def test_metric_is_exposed_with_type(name: str, kind: str) -> None:
+    assert f"# TYPE {name} {kind}" in _exposition()
+
+
+def test_failed_counter_labels() -> None:
+    metrics.JOBS_FAILED.labels(queue="t", outcome="retried", trigger="exception").inc(0)
+    assert (
+        REGISTRY.get_sample_value(
+            "distqueue_jobs_failed_total",
+            {"queue": "t", "outcome": "retried", "trigger": "exception"},
+        )
+        is not None
+    )
+
+
+def test_duration_buckets_cover_demo_and_load_test_ranges() -> None:
+    """Buckets must resolve both the load test's ~ms no-op jobs and the
+    demo's 0.1–1 s jobs; histogram_quantile can't see inside a bucket."""
+    metrics.JOBS_DURATION.labels(queue="buckets").observe(0.0)
+    text = _exposition()
+    for le in ("0.005", "0.1", "0.5", "1.0", "300.0", "+Inf"):
+        assert (
+            f'distqueue_job_duration_seconds_bucket{{le="{le}",queue="buckets"}}'
+            in text
+        )
+
+
+def test_start_metrics_server_serves_scrapes() -> None:
+    """The server binds and answers a real HTTP scrape."""
+    import socket
+    import urllib.request
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    metrics.start_metrics_server(port=port)
+    body = urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5).read()
+    assert b"distqueue_jobs_enqueued_total" in body

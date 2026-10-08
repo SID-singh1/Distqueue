@@ -1,299 +1,369 @@
 """
 test_worker.py — Integration tests for distqueue.worker.Worker.
 
-These tests require a running Redis instance.  Start one with:
-
-    docker compose -f docker/docker-compose.yml up -d
-
-All tests in this file are marked with @pytest.mark.integration so they
-can be excluded from fast unit-test runs via:
-
-    pytest -m "not integration"
+Requires Redis (see conftest.py).  Tests drive the worker one step at a
+time with process_one() wherever possible; run() is used only for the
+behaviours that live in the loop (heartbeat, self-fencing, recovery).
 """
 
 from __future__ import annotations
 
 import threading
-import time
 
 import pytest
+import redis
 
 from distqueue import config
-from distqueue.job import Job
+from distqueue.errors import PermanentError
+from distqueue.job import Job, JobStatus
 from distqueue.producer import enqueue
 from distqueue.worker import Worker
+from tests.integration.helpers import (
+    deliver,
+    redis_now,
+    sample,
+    seed_job,
+    wait_until,
+)
 
-
-# Apply the integration marker to every test in this module.
 pytestmark = pytest.mark.integration
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _noop(payload: dict) -> None:
+    """Handler that always succeeds."""
 
 
-def _noop_handler(payload: dict) -> None:
-    """Handler that always succeeds — does nothing."""
-
-
-def _always_fail_handler(payload: dict) -> None:
-    """Handler that always raises, simulating a failing downstream call."""
+def _always_fail(payload: dict) -> None:
     raise RuntimeError("simulated failure")
 
 
-# ---------------------------------------------------------------------------
-# Success path
-# ---------------------------------------------------------------------------
+def _job(client, job_id: str) -> Job:
+    return Job.from_redis_hash(client.hgetall(config.job_key(job_id)))
 
 
-class TestWorkerSuccess:
-    """Verify the happy path: job enqueued → processed → COMPLETED."""
+def _pending(client, queue: str = config.DEFAULT_QUEUE) -> int:
+    return client.xpending(config.stream_key(queue), config.CONSUMER_GROUP)["pending"]
 
-    def test_successful_job(self, redis_client) -> None:
-        """A job whose handler returns normally should end up with
-        status=COMPLETED and zero pending entries (fully acked)."""
-        # Create worker FIRST so the consumer group exists before the
-        # message is added.  The group is created with id="$" so it only
-        # sees messages added after this point.
-        worker = Worker(
-            redis_client,
-            handler=_noop_handler,
-            block_ms=500,
-        )
 
-        job_id = enqueue(redis_client, {"task": "test_success"})
+class _FlakyClient:
+    """Proxy that makes SET (the heartbeat write) fail the first N times."""
 
-        result = worker.process_one()
-        assert result is True
+    def __init__(self, real: redis.Redis, failures: int) -> None:
+        self._real = real
+        self.failures = failures
 
-        # Verify job hash shows COMPLETED.
-        raw = redis_client.hgetall(f"{config.JOB_HASH_KEY_PREFIX}{job_id}")
-        job = Job.from_redis_hash(raw)
-        assert job.status == "COMPLETED"
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
 
-        # Verify XPENDING shows zero pending entries — the stream entry
-        # was fully acknowledged, nothing left in the PEL.
-        pending_info = redis_client.xpending(
-            config.QUEUE_NAME, config.CONSUMER_GROUP
-        )
-        assert pending_info["pending"] == 0
+    def set(self, *args, **kwargs):
+        if self.failures != 0:
+            self.failures -= 1
+            raise redis.ConnectionError("simulated network blip")
+        return self._real.set(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
-# Failure → DLQ path
+# Outcomes: success, retry, DLQ, permanent
 # ---------------------------------------------------------------------------
 
 
-class TestWorkerDLQ:
-    """Verify that a job whose handler always raises, with no retries
-    remaining, lands in the dead-letter queue."""
+class TestOutcomes:
+    def test_success_completes_acks_and_sets_retention_ttl(self, redis_client) -> None:
+        worker = Worker(redis_client, _noop, block_ms=200)
+        job_id = enqueue(redis_client, {"task": "ok"})
 
-    def test_handler_raises_max_attempts_1_goes_to_dlq(
-        self, redis_client
-    ) -> None:
-        """With max_attempts=1, the very first failure should DLQ the job.
+        assert worker.process_one() is True
 
-        After process_one():
-          - job.status == "DEAD"
-          - job.attempts == 1  (0 → 1 on the failure)
-          - DLQ stream contains the job
-          - original stream entry is acked (pending == 0)
-        """
-        worker = Worker(
-            redis_client,
-            handler=_always_fail_handler,
-            block_ms=500,
-        )
+        job = _job(redis_client, job_id)
+        assert job.status == JobStatus.COMPLETED
+        assert job.last_worker == worker.consumer_name
+        assert _pending(redis_client) == 0
+        ttl = redis_client.ttl(config.job_key(job_id))
+        assert 0 < ttl <= config.COMPLETED_JOB_TTL_S
 
-        job_id = enqueue(
-            redis_client, {"task": "test_dlq"}, max_attempts=1
-        )
+    def test_failure_with_retries_left_schedules_backoff(self, redis_client) -> None:
+        worker = Worker(redis_client, _always_fail, block_ms=200)
+        job_id = enqueue(redis_client, {}, max_attempts=3)
 
-        result = worker.process_one()
-        assert result is True
+        before = redis_now(redis_client)
+        worker.process_one()
+        after = redis_now(redis_client)
 
-        # Job hash should be DEAD with attempts=1.
-        raw = redis_client.hgetall(f"{config.JOB_HASH_KEY_PREFIX}{job_id}")
-        job = Job.from_redis_hash(raw)
-        assert job.status == "DEAD"
+        job = _job(redis_client, job_id)
+        assert job.status == JobStatus.PENDING
         assert job.attempts == 1
-        assert "simulated failure" in job.last_error
-
-        # DLQ stream should contain exactly one entry with this job's ID.
-        dlq_entries = redis_client.xrange(config.DLQ_STREAM)
-        assert len(dlq_entries) == 1
-        _msg_id, fields = dlq_entries[0]
-        assert fields["job_id"] == job_id
-        assert fields["reason"] == "simulated failure"
-
-        # Original stream entry should be fully acked.
-        pending_info = redis_client.xpending(
-            config.QUEUE_NAME, config.CONSUMER_GROUP
-        )
-        assert pending_info["pending"] == 0
-
-
-# ---------------------------------------------------------------------------
-# Failure → retry path
-# ---------------------------------------------------------------------------
-
-
-class TestWorkerRetry:
-    """Verify that a failed job with retries remaining gets scheduled
-    in the delayed ZSet with the correct backoff delay."""
-
-    def test_handler_raises_with_retries_remaining(
-        self, redis_client
-    ) -> None:
-        """With max_attempts=3 and a handler that raises:
-          - attempts should increment from 0 to 1
-          - status should stay PENDING (not DEAD)
-          - job should appear in the delayed ZSet
-          - the ZSet score (next_retry_at) should be roughly
-            BASE_BACKOFF_S * 2^1 seconds in the future (with jitter)
-          - original stream entry should be acked
-        """
-        worker = Worker(
-            redis_client,
-            handler=_always_fail_handler,
-            block_ms=500,
-        )
-
-        job_id = enqueue(
-            redis_client, {"task": "test_retry"}, max_attempts=3
-        )
-
-        before = time.time()
-        result = worker.process_one()
-        after = time.time()
-        assert result is True
-
-        # Job hash should show attempts=1, status=PENDING.
-        raw = redis_client.hgetall(f"{config.JOB_HASH_KEY_PREFIX}{job_id}")
-        job = Job.from_redis_hash(raw)
-        assert job.status == "PENDING"
-        assert job.attempts == 1
-        assert "simulated failure" in job.last_error
-
-        # Job should be in the delayed ZSet.
+        assert job.last_error == "RuntimeError: simulated failure"
+        # First retry: equal jitter over d = 2 * 2**1 = 4 s  ->  [2, 4] s.
         score = redis_client.zscore(config.DELAYED_ZSET, job_id)
-        assert score is not None
+        assert before + 2.0 - 0.05 <= score <= after + 4.0 + 0.05
+        assert _pending(redis_client) == 0
 
-        # Verify the score is in the expected range.
-        # delay = min(BASE_BACKOFF_S * 2^1 + jitter, MAX_BACKOFF_S)
-        #       = min(2 * 2 + [0, 1], 300)
-        #       = [4.0, 5.0]
-        # So next_retry_at should be between before+4 and after+5 (with
-        # some tolerance for test execution overhead).
-        expected_min_delay = config.BASE_BACKOFF_S * (2 ** 1)  # 4.0
-        expected_max_delay = expected_min_delay + config.JITTER_MAX_S  # 5.0
-        assert score >= before + expected_min_delay - 0.5
-        assert score <= after + expected_max_delay + 0.5
+    def test_failure_at_max_attempts_dead_letters(self, redis_client) -> None:
+        worker = Worker(redis_client, _always_fail, block_ms=200)
+        job_id = enqueue(redis_client, {}, max_attempts=1)
 
-        # Original stream entry should be acked.
-        pending_info = redis_client.xpending(
-            config.QUEUE_NAME, config.CONSUMER_GROUP
+        worker.process_one()
+
+        job = _job(redis_client, job_id)
+        assert job.status == JobStatus.DEAD
+        assert job.attempts == 1
+        [(_, fields)] = redis_client.xrange(config.DLQ_STREAM)
+        assert fields["job_id"] == job_id
+        assert fields["queue"] == config.DEFAULT_QUEUE
+        assert fields["reason"] == "RuntimeError: simulated failure"
+        assert fields["attempts"] == "1"
+        assert fields["trigger"] == "exception"
+        assert _pending(redis_client) == 0
+        assert 0 < redis_client.ttl(config.job_key(job_id)) <= config.DEAD_JOB_TTL_S
+
+    def test_permanent_error_skips_retries(self, redis_client) -> None:
+        def reject(payload: dict) -> None:
+            raise PermanentError("invalid payload")
+
+        worker = Worker(redis_client, reject, block_ms=200)
+        job_id = enqueue(redis_client, {}, max_attempts=5)
+
+        worker.process_one()
+
+        job = _job(redis_client, job_id)
+        assert job.status == JobStatus.DEAD
+        assert job.attempts == 1
+        assert redis_client.zcard(config.DELAYED_ZSET) == 0
+        [(_, fields)] = redis_client.xrange(config.DLQ_STREAM)
+        assert fields["trigger"] == "permanent"
+        assert fields["reason"] == "PermanentError: invalid payload"
+
+    def test_empty_queue_returns_false(self, redis_client) -> None:
+        assert Worker(redis_client, _noop, block_ms=100).process_one() is False
+
+
+# ---------------------------------------------------------------------------
+# Delivery edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveryEdgeCases:
+    def test_jobs_enqueued_before_first_worker_are_processed(
+        self, redis_client
+    ) -> None:
+        """Regression test for the cold-start bug.
+
+        The consumer group used to be created at "$" (only *new* entries),
+        so jobs enqueued before the first worker ever started were skipped
+        forever.  It is now created at "0".
+        """
+        ids = [enqueue(redis_client, {"n": i}) for i in range(3)]
+        worker = Worker(redis_client, _noop, block_ms=200)
+
+        for _ in ids:
+            assert worker.process_one() is True
+
+        assert all(_job(redis_client, i).status == JobStatus.COMPLETED for i in ids)
+
+    def test_duplicate_delivery_of_completed_job_is_skipped(self, redis_client) -> None:
+        calls: list[dict] = []
+        worker = Worker(redis_client, calls.append, block_ms=200)
+        seed_job(redis_client, Job(id="done-1", status=JobStatus.COMPLETED))
+        redis_client.xadd(config.QUEUE_NAME, {"job_id": "done-1"})
+        skipped = sample(
+            "distqueue_jobs_skipped_total", queue="default", reason="terminal"
         )
-        assert pending_info["pending"] == 0
 
+        assert worker.process_one() is True
 
-# ---------------------------------------------------------------------------
-# Consumer group idempotency
-# ---------------------------------------------------------------------------
+        assert calls == [], "a COMPLETED job must never run again"
+        assert _job(redis_client, "done-1").status == JobStatus.COMPLETED
+        assert _pending(redis_client) == 0
+        delta = sample(
+            "distqueue_jobs_skipped_total", queue="default", reason="terminal"
+        )
+        assert delta - skipped == 1
 
+    def test_missing_hash_is_acked(self, redis_client) -> None:
+        worker = Worker(redis_client, _noop, block_ms=200)
+        redis_client.xadd(config.QUEUE_NAME, {"job_id": "ghost"})
+        assert worker.process_one() is True
+        assert _pending(redis_client) == 0
+        # The guard must not create a stub hash as a side effect.
+        assert not redis_client.exists(config.job_key("ghost"))
 
-class TestConsumerGroupIdempotent:
-    """Verify that creating multiple Worker instances against the same
-    stream doesn't raise — XGROUP CREATE handles BUSYGROUP gracefully."""
+    def test_corrupt_hash_is_dead_lettered_not_crashed_on(self, redis_client) -> None:
+        """A hash missing required fields used to raise KeyError out of
+        process_one, crashing the worker and leaving a poison entry."""
+        worker = Worker(redis_client, _noop, block_ms=200)
+        redis_client.hset(config.job_key("bad"), mapping={"next_retry_at": ""})
+        redis_client.xadd(config.QUEUE_NAME, {"job_id": "bad"})
+
+        assert worker.process_one() is True
+
+        [(_, fields)] = redis_client.xrange(config.DLQ_STREAM)
+        assert fields["job_id"] == "bad"
+        assert fields["trigger"] == "corrupt"
+        assert "KeyError" in fields["reason"]
+        assert _pending(redis_client) == 0
+
+    def test_entry_without_job_id_is_acked(self, redis_client) -> None:
+        worker = Worker(redis_client, _noop, block_ms=200)
+        redis_client.xadd(config.QUEUE_NAME, {"something": "else"})
+        assert worker.process_one() is True
+        assert _pending(redis_client) == 0
+
+    def test_worker_only_consumes_its_own_queue(self, redis_client) -> None:
+        email_job = enqueue(redis_client, {}, queue="emails")
+        default_job = enqueue(redis_client, {})
+        worker = Worker(redis_client, _noop, queue="emails", block_ms=200)
+
+        assert worker.process_one() is True
+        assert worker.process_one() is False
+
+        assert _job(redis_client, email_job).status == JobStatus.COMPLETED
+        assert _job(redis_client, default_job).status == JobStatus.PENDING
 
     def test_two_workers_same_group_no_error(self, redis_client) -> None:
-        """Constructing two Workers against the same stream/group should
-        succeed without errors.  The second Worker's XGROUP CREATE sees
-        BUSYGROUP and silently ignores it."""
-        worker_1 = Worker(
-            redis_client,
-            handler=_noop_handler,
-            consumer_name="worker-1",
-        )
-        worker_2 = Worker(
-            redis_client,
-            handler=_noop_handler,
-            consumer_name="worker-2",
-        )
-        # If we got here without an exception, the test passes.
-        # Verify both workers have distinct consumer names.
-        assert worker_1._consumer_name == "worker-1"
-        assert worker_2._consumer_name == "worker-2"
+        """XGROUP CREATE's BUSYGROUP error is swallowed (idempotent)."""
+        w1 = Worker(redis_client, _noop, consumer_name="worker-1")
+        w2 = Worker(redis_client, _noop, consumer_name="worker-2")
+        assert (w1.consumer_name, w2.consumer_name) == ("worker-1", "worker-2")
 
 
 # ---------------------------------------------------------------------------
-# Heartbeat
+# Heartbeat, self-fencing, and run-loop resilience
 # ---------------------------------------------------------------------------
 
 
-class TestWorkerHeartbeat:
-    """Verify the heartbeat daemon thread sets a key with a TTL in Redis."""
+def _start(worker: Worker) -> threading.Thread:
+    t = threading.Thread(target=worker.run, daemon=True)
+    t.start()
+    return t
 
-    def test_heartbeat_key_exists_after_run_starts(
-        self, redis_client
-    ) -> None:
-        """After run() starts, the heartbeat key should appear in Redis
-        with a positive TTL.  Uses short intervals so the test finishes
-        quickly instead of waiting for the default 5s heartbeat interval."""
+
+class TestRunLoop:
+    def test_heartbeat_key_exists_with_ttl(self, redis_client) -> None:
         stop = threading.Event()
         worker = Worker(
             redis_client,
-            handler=_noop_handler,
+            _noop,
             stop_event=stop,
             block_ms=100,
-            # Short intervals for fast testing — don't wait 5s.
-            heartbeat_interval_s=0.1,
+            heartbeat_interval_s=0.05,
             heartbeat_ttl_s=5,
         )
+        thread = _start(worker)
+        key = config.heartbeat_key(worker.consumer_name)
+        try:
+            assert wait_until(lambda: redis_client.exists(key))
+            assert redis_client.ttl(key) > 0
+        finally:
+            stop.set()
+            thread.join(timeout=5)
 
-        # Run the worker in a background thread.
-        run_thread = threading.Thread(target=worker.run, daemon=True)
-        run_thread.start()
+    def test_heartbeat_survives_redis_errors(self, redis_client) -> None:
+        """Regression test for the zombie-worker bug.
 
-        # Give the heartbeat thread time to fire at least once.
-        time.sleep(0.5)
-
-        heartbeat_key = (
-            f"{config.WORKER_HEARTBEAT_KEY_PREFIX}"
-            f"{worker._consumer_name}"
-            f"{config.WORKER_HEARTBEAT_KEY_SUFFIX}"
+        The heartbeat loop had no exception handling: one failed SET killed
+        the heartbeat thread while the worker kept consuming jobs, invisible
+        to the monitor.  Now failures are counted and the next beat retries.
+        """
+        flaky = _FlakyClient(redis_client, failures=3)
+        stop = threading.Event()
+        worker = Worker(
+            flaky,
+            _noop,
+            stop_event=stop,
+            block_ms=100,
+            heartbeat_interval_s=0.05,
+            heartbeat_ttl_s=5,
         )
+        failures_before = sample("distqueue_heartbeat_failures_total")
+        thread = _start(worker)
+        try:
+            key = config.heartbeat_key(worker.consumer_name)
+            assert wait_until(lambda: redis_client.exists(key), timeout=5)
+            assert sample("distqueue_heartbeat_failures_total") - failures_before >= 3
+            job_id = enqueue(redis_client, {})
+            assert wait_until(
+                lambda: _job(redis_client, job_id).status == JobStatus.COMPLETED
+            )
+        finally:
+            stop.set()
+            thread.join(timeout=5)
 
-        # The key should exist and have a positive TTL.
-        assert redis_client.exists(heartbeat_key), (
-            f"Heartbeat key {heartbeat_key} not found in Redis"
+    def test_worker_without_heartbeat_takes_no_work(self, redis_client) -> None:
+        """Self-fencing: if the worker can't prove it's alive, any job it
+        took could be reclaimed and run twice — so it takes none."""
+        always_down = _FlakyClient(redis_client, failures=-1)  # never succeeds
+        stop = threading.Event()
+        worker = Worker(
+            always_down, _noop, stop_event=stop, block_ms=100, heartbeat_interval_s=0.05
         )
-        ttl = redis_client.ttl(heartbeat_key)
-        assert ttl > 0, f"Expected positive TTL, got {ttl}"
+        job_id = enqueue(redis_client, {})
+        thread = _start(worker)
+        try:
+            assert not wait_until(
+                lambda: _job(redis_client, job_id).status != JobStatus.PENDING,
+                timeout=0.75,
+            )
+            assert _pending(redis_client) == 0
+        finally:
+            stop.set()
+            thread.join(timeout=5)
 
-        # Clean shutdown.
-        stop.set()
-        run_thread.join(timeout=5)
+    def test_run_loop_survives_lost_consumer_group(self, redis_client) -> None:
+        """Regression test: NOGROUP used to crash run() (and the container).
 
-
-# ---------------------------------------------------------------------------
-# Empty queue
-# ---------------------------------------------------------------------------
-
-
-class TestWorkerEmptyQueue:
-    """Verify process_one() returns False when no jobs are available."""
-
-    def test_returns_false_on_empty_queue(self, redis_client) -> None:
-        """With nothing enqueued, process_one() should block briefly
-        (block_ms) and then return False."""
+        FLUSHDB stands in for "Redis restarted without persistence"; the
+        worker must recreate its group and keep processing.
+        """
+        stop = threading.Event()
         worker = Worker(
             redis_client,
-            handler=_noop_handler,
-            # Short block so the test doesn't wait 2 full seconds.
+            _noop,
+            stop_event=stop,
             block_ms=100,
+            heartbeat_interval_s=0.05,
+        )
+        thread = _start(worker)
+        try:
+            first = enqueue(redis_client, {})
+            assert wait_until(lambda: _job(redis_client, first).status == "COMPLETED")
+            redis_client.flushdb()
+            second = enqueue(redis_client, {})
+            assert wait_until(
+                lambda: (
+                    redis_client.hget(config.job_key(second), "status") == "COMPLETED"
+                ),
+                timeout=10,
+            )
+            assert thread.is_alive()
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+    def test_graceful_shutdown_deregisters(self, redis_client) -> None:
+        stop = threading.Event()
+        worker = Worker(
+            redis_client,
+            _noop,
+            stop_event=stop,
+            block_ms=100,
+            heartbeat_interval_s=0.05,
+        )
+        thread = _start(worker)
+        key = config.heartbeat_key(worker.consumer_name)
+        assert wait_until(lambda: redis_client.exists(key))
+        assert wait_until(
+            lambda: len(redis_client.xinfo_consumers(config.QUEUE_NAME, "workers")) == 1
         )
 
-        result = worker.process_one()
-        assert result is False
+        stop.set()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert not redis_client.exists(key)
+        assert redis_client.xinfo_consumers(config.QUEUE_NAME, "workers") == []
+
+    def test_deliver_helper_places_entry_in_pel(self, redis_client) -> None:
+        """Sanity check for the helper other suites rely on."""
+        seed_job(redis_client, Job(id="h-1"))
+        deliver(redis_client, "h-1", "someone")
+        assert _pending(redis_client) == 1

@@ -1,60 +1,115 @@
 """
-monitor.py — Dead-worker detection and job reclamation for distqueue.
+monitor.py — Dead-worker detection, job timeouts, and queue housekeeping.
 
-The monitor periodically scans the Pending Entries List (PEL) for stream
-entries that have been idle too long, checks whether the owning worker is
-still alive via its heartbeat key, and reclaims orphaned jobs from dead
-workers.
+Each tick, for every known queue, the monitor:
 
-This is the "last line of defense" in the failure-detection design:
+  1. **Reclaims** jobs whose worker is dead (heartbeat key expired) or that
+     have run past their ``timeout_s`` even though the worker is alive.
+     Reclaimed jobs go through the same FAIL transition as a handler
+     exception — a lost attempt is a failed attempt, otherwise a poison
+     job that kills its worker would be retried forever.
+  2. **Trims** the stream of entries every consumer has finished with.
+  3. **Garbage-collects** consumer names left behind by dead workers.
+  4. **Publishes** queue-state gauges (backlog, PEL, delayed, DLQ, live
+     workers) — the single observer of global queue state.
 
-  1. A healthy worker refreshes its heartbeat key every HEARTBEAT_INTERVAL_S
-     (5s) with a TTL of HEARTBEAT_TTL_S (15s).
-  2. If a worker crashes or loses connectivity, its heartbeat key expires
-     after 15 seconds (no refresh).
-  3. The monitor finds the dead worker's PEL entries via XPENDING IDLE,
-     confirms the heartbeat is gone, and reclaims the job via XAUTOCLAIM.
-
-Reclaimed jobs go through the same retry-or-DLQ logic as handler exceptions
-(via the shared handle_job_failure function in worker.py) — a worker death
-counts as a failed attempt, which is the correct semantic: if the job wasn't
-completed, the attempt was wasted, and the retry budget should reflect that.
-Without this, a poison job that kills its worker would retry forever.
+Safe to run as several replicas: every reclaim is an XCLAIM with a minimum
+idle time on one exact entry id (see _reclaim_entry), so two monitors
+racing for the same entry cannot both win, and neither can take an entry
+it did not mean to.
 """
 
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import uuid
 
 import redis
 
 from distqueue import config
-from distqueue.job import Job
-from distqueue.metrics import JOBS_RECLAIMED, PENDING_ENTRIES
-from distqueue.worker import handle_job_failure
+from distqueue.job import TERMINAL_STATUSES, Job
+from distqueue.metrics import (
+    DELAYED_JOBS,
+    DLQ_DEPTH,
+    JOBS_RECLAIMED,
+    JOBS_SKIPPED,
+    LIVE_WORKERS,
+    PENDING_ENTRIES,
+    QUEUE_BACKLOG,
+    STREAM_LENGTH,
+)
+from distqueue.runloop import run_until_stopped
+from distqueue.stats import known_queues, live_consumers, queue_stats
+from distqueue.transitions import (
+    FailOutcome,
+    LuaScript,
+    dead_letter_unreadable,
+    fail_job,
+    format_error,
+)
 
 logger = logging.getLogger(__name__)
 
+# Delete a consumer from the group only if, atomically: it has no heartbeat
+# and no pending entries.  As separate commands there's a window where a
+# worker could read a job between our check and the delete — and
+# XGROUP DELCONSUMER silently discards a consumer's pending entries, so
+# that job would be orphaned forever (delivered, never acked, never
+# reclaimable).
+# KEYS: 1 stream, 2 heartbeat key   ARGV: 1 group, 2 consumer
+_GC_CONSUMER = LuaScript(
+    "gc_consumer",
+    """
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+end
+if #redis.call('XPENDING', KEYS[1], ARGV[1], '-', '+', 1, ARGV[2]) > 0 then
+    return 0
+end
+redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], ARGV[2])
+return 1
+""",
+)
+
+
+def _parse_id(entry_id: str) -> tuple[int, int]:
+    """Stream ids compare numerically on (ms, seq), not as strings."""
+    ms, _, seq = entry_id.partition("-")
+    return int(ms), int(seq or 0)
+
+
+def _is_nogroup(exc: redis.ResponseError) -> bool:
+    return "NOGROUP" in str(exc) or "no such key" in str(exc).lower()
+
 
 class Monitor:
-    """Detects dead workers and reclaims their orphaned jobs.
+    """Detects dead and timed-out jobs and reclaims them.
 
     Parameters
     ----------
     client : redis.Redis
         A connected Redis client.
-    queue_name : str
-        The Redis Stream to monitor.
+    queues : list[str] | None
+        Queues to watch.  None (the default) means "every queue in the
+        jobs:queues registry", re-read each tick so new queues are picked up
+        without a restart.
     group_name : str
         The consumer group whose PEL to scan.
     poll_interval_s : float
         Seconds between tick() calls in the run() loop.
     min_idle_ms : int
-        Minimum idle time (in milliseconds) a PEL entry must have before
-        the monitor considers it.  This is a coarse pre-filter — the
-        actual reclaim decision is gated on the heartbeat check.
+        Minimum idle time before a PEL entry is considered at all.
+    scan_count : int
+        Max PEL entries examined per queue per tick.
+    consumer_gc_idle_ms : int
+        Idle time after which a consumer with no heartbeat and nothing
+        pending is removed from the group.
+    approximate_trim : bool
+        Use ``XTRIM MINID ~`` (cheap; removes whole radix-tree nodes of
+        ~100 entries) rather than exact trimming.  Tests turn it off to
+        observe trimming on small streams.
     stop_event : threading.Event | None
         When set, the run() loop exits cleanly.
     """
@@ -62,205 +117,307 @@ class Monitor:
     def __init__(
         self,
         client: redis.Redis,
-        queue_name: str = config.QUEUE_NAME,
+        queues: list[str] | None = None,
         group_name: str = config.CONSUMER_GROUP,
         poll_interval_s: float = config.MONITOR_POLL_INTERVAL_S,
         min_idle_ms: int = config.MONITOR_MIN_IDLE_MS,
+        scan_count: int = config.MONITOR_SCAN_COUNT,
+        consumer_gc_idle_ms: int = config.CONSUMER_GC_IDLE_MS,
+        approximate_trim: bool = True,
         stop_event: threading.Event | None = None,
     ) -> None:
         self._client = client
-        self._queue_name = queue_name
+        self._queues = list(queues) if queues is not None else None
         self._group_name = group_name
         self._poll_interval_s = poll_interval_s
         self._min_idle_ms = min_idle_ms
+        self._scan_count = scan_count
+        self._consumer_gc_idle_ms = consumer_gc_idle_ms
+        self._approximate_trim = approximate_trim
         self._stop_event = stop_event or threading.Event()
 
-        # The monitor claims orphaned entries under its own consumer name.
-        # This name must be unique so that multiple monitor instances don't
-        # collide, and distinct from real worker names so it's easy to spot
-        # in XPENDING output during debugging.
-        self._consumer_name = f"monitor-reclaim-{uuid.uuid4().hex[:6]}"
+        # Reclaimed entries are XCLAIMed to this consumer name before the
+        # FAIL transition acks them.  Unique per monitor so replicas don't
+        # share an identity, and prefixed so it's obvious in XPENDING output.
+        # It deliberately has no heartbeat: if a monitor dies between XCLAIM
+        # and FAIL, another monitor sees a dead owner and reclaims it again.
+        self._consumer_name = f"monitor-{socket.gethostname()}-{uuid.uuid4().hex[:6]}"
+
+        # Per-queue PEL scan cursor.  Without it every tick re-read the
+        # *first* scan_count idle entries; if those all belonged to live
+        # workers running long jobs, dead workers' entries further along
+        # were never examined at all.
+        self._cursors: dict[str, str] = {}
+
+    @property
+    def consumer_name(self) -> str:
+        return self._consumer_name
+
+    # ------------------------------------------------------------------
+    # Tick
+    # ------------------------------------------------------------------
+
+    def queues(self) -> list[str]:
+        """Queues to watch this tick."""
+        if self._queues is not None:
+            return self._queues
+        return known_queues(self._client)
 
     def tick(self) -> int:
-        """One monitoring pass: find and reclaim jobs from dead workers.
+        """One monitoring pass over every queue.  Returns jobs reclaimed."""
+        reclaimed = 0
+        live_consumers: set[str] = set()
+        for queue in self.queues():
+            try:
+                reclaimed += self.reclaim(queue)
+                live_consumers |= self.collect_consumers(queue)
+                self.trim(queue)
+                self._update_queue_gauges(queue)
+            except redis.ResponseError as exc:
+                if not _is_nogroup(exc):
+                    raise
+                # No group yet: no worker has ever consumed this queue, so
+                # there's nothing pending to reclaim and nothing to trim.
+                self._update_queue_gauges(queue)
 
-        Returns the number of jobs actually reclaimed.
+        DELAYED_JOBS.set(self._client.zcard(config.DELAYED_ZSET))
+        DLQ_DEPTH.set(self._client.xlen(config.DLQ_STREAM))
+        LIVE_WORKERS.set(len(live_consumers))
+        return reclaimed
 
-        Flow:
-          1. XPENDING with IDLE filter → list PEL entries idle > min_idle_ms
-          2. For each, check if the owning worker's heartbeat key exists
-          3. If heartbeat present → skip (worker is alive, just slow)
-          4. If heartbeat absent → worker is presumed dead:
-             a. XAUTOCLAIM the entry to the monitor's consumer
-             b. Apply retry-or-DLQ logic (via handle_job_failure)
+    # ------------------------------------------------------------------
+    # 1. Reclamation
+    # ------------------------------------------------------------------
 
-        This method is deliberately separate from run() so tests can call
-        it directly for deterministic, single-pass assertions.
-        """
-        # XPENDING with IDLE: returns PEL entries idle for >= min_idle_ms.
-        # Each entry includes the owning consumer name, which we need for
-        # the heartbeat check.  Count capped at 100 for the same reason as
-        # the scheduler's batch_size — prevents one tick from running
-        # unboundedly long on a large PEL.
+    def reclaim(self, queue: str) -> int:
+        """Reclaim dead-worker and timed-out jobs on one queue."""
+        stream = config.stream_key(queue)
+        start = self._cursors.get(queue, "-")
         pending = self._client.xpending_range(
-            self._queue_name,
+            stream,
             self._group_name,
-            min="-",
+            min=start,
             max="+",
-            count=100,
+            count=self._scan_count,
             idle=self._min_idle_ms,
         )
-
+        # Advance the cursor; wrap to the beginning after a short page.
+        if len(pending) < self._scan_count:
+            self._cursors[queue] = "-"
+        else:
+            self._cursors[queue] = "(" + pending[-1]["message_id"]
         if not pending:
-            # Still update the PEL gauge even when no idle entries matched.
-            pending_summary = self._client.xpending(
-                self._queue_name, self._group_name
-            )
-            PENDING_ENTRIES.labels(queue=self._queue_name).set(
-                pending_summary["pending"]
-            )
             return 0
+
+        # One pipelined round trip for every owner's heartbeat.
+        owners = sorted({entry["consumer"] for entry in pending})
+        pipe = self._client.pipeline(transaction=False)
+        for owner in owners:
+            pipe.exists(config.heartbeat_key(owner))
+        alive = {owner for owner, ok in zip(owners, pipe.execute(), strict=True) if ok}
 
         reclaimed = 0
         for entry in pending:
-            consumer_name = entry["consumer"]
+            owner = entry["consumer"]
             entry_id = entry["message_id"]
+            idle_ms = int(entry["time_since_delivered"])
 
-            # --- Heartbeat check: is this worker still alive? ---
-            heartbeat_key = (
-                f"{config.WORKER_HEARTBEAT_KEY_PREFIX}"
-                f"{consumer_name}"
-                f"{config.WORKER_HEARTBEAT_KEY_SUFFIX}"
-            )
-            if self._client.exists(heartbeat_key):
-                # Worker is alive — it's just slow (e.g. running a long
-                # handler, or the XREADGROUP block hasn't timed out yet).
-                # Don't touch this entry; the worker will eventually XACK
-                # it or fail it normally.
-                continue
-
-            # --- Worker is presumed dead: reclaim via XAUTOCLAIM ---
-            #
-            # Why XAUTOCLAIM instead of XCLAIM?
-            #
-            # XCLAIM requires you to specify exact entry IDs and will error
-            # (or silently do nothing) if an entry no longer exists in the
-            # stream (e.g. it was XDEL'd or the stream was trimmed).  You'd
-            # have to add your own error handling for this edge case.
-            #
-            # XAUTOCLAIM handles this gracefully: it scans the PEL from a
-            # start ID, claims eligible entries, and returns deleted entries
-            # in a separate list — no exception, no silent data loss.  It
-            # also re-checks the idle time atomically, so if another monitor
-            # instance already reclaimed this entry (resetting its idle time),
-            # XAUTOCLAIM simply skips it.  This makes the monitor naturally
-            # safe to run as multiple replicas without coordination.
-            #
-            # We pass start_id=entry_id and count=1 to target the specific
-            # entry we identified via XPENDING.
-            result = self._client.xautoclaim(
-                self._queue_name,
-                self._group_name,
-                self._consumer_name,
-                min_idle_time=self._min_idle_ms,
-                start_id=entry_id,
-                count=1,
-            )
-
-            # xautoclaim returns: (next_start_id, claimed_entries, deleted_ids)
-            # claimed_entries: list of (entry_id, {field: value})
-            # deleted_ids: entries that no longer exist in the stream
-            _next_id, claimed_entries, _deleted_ids = result
-
-            if not claimed_entries:
-                # Entry was already reclaimed by another monitor, or its
-                # idle time was reset (unlikely given the heartbeat is gone,
-                # but defensive coding).
-                continue
-
-            for claimed_id, fields in claimed_entries:
-                job_id = fields.get("job_id")
-                if not job_id:
-                    # Malformed stream entry — shouldn't happen, but XACK
-                    # it to clear it from the PEL regardless.
-                    logger.warning(
-                        "Stream entry %s has no job_id field — acking to "
-                        "clear from PEL.",
-                        claimed_id,
-                    )
-                    self._client.xack(
-                        self._queue_name, self._group_name, claimed_id
-                    )
+            if owner not in alive:
+                reason = "worker_death"
+                claim_idle_ms = self._min_idle_ms
+                error = f"worker {owner} presumed dead (heartbeat expired)"
+            else:
+                # Alive worker: only reclaim if the job has outrun its
+                # timeout.  PEL idle time is "time since delivery", which for
+                # a running job is exactly its run time so far.
+                timeout_s = self._job_timeout(stream, entry_id)
+                if not timeout_s or idle_ms < timeout_s * 1000:
                     continue
+                reason = "timeout"
+                claim_idle_ms = int(timeout_s * 1000)
+                error = f"job exceeded timeout of {timeout_s:g}s on worker {owner}"
 
-                hash_key = f"{config.JOB_HASH_KEY_PREFIX}{job_id}"
-                raw = self._client.hgetall(hash_key)
-
-                if not raw:
-                    # Job hash doesn't exist — same edge case as worker.py.
-                    # XACK to clear the PEL entry.
-                    logger.warning(
-                        "Job hash %s not found during reclamation — acking "
-                        "entry %s to clear PEL.",
-                        hash_key,
-                        claimed_id,
-                    )
-                    self._client.xack(
-                        self._queue_name, self._group_name, claimed_id
-                    )
-                    continue
-
-                job = Job.from_redis_hash(raw)
-
-                # A worker death counts as a failed attempt — same logic
-                # as a handler exception, just with a different error
-                # message so the retry/DLQ history distinguishes
-                # "application error" from "infrastructure failure."
-                error_msg = (
-                    f"worker {consumer_name} presumed dead "
-                    f"(heartbeat expired)"
-                )
-
-                handle_job_failure(
-                    self._client,
-                    job,
-                    hash_key,
-                    claimed_id,
-                    self._queue_name,
-                    self._group_name,
-                    error_message=error_msg,
-                    trigger="worker_death",
-                )
+            if self._reclaim_entry(queue, entry_id, claim_idle_ms, error, reason):
                 reclaimed += 1
-                JOBS_RECLAIMED.labels(queue=self._queue_name).inc()
-
-        # --- Update PEL gauge once per tick ---
-        # This uses an *unfiltered* XPENDING summary (no IDLE parameter)
-        # because we want the total PEL size, not just the idle entries.
-        # The idle-filtered query above is for reclaim candidates; this
-        # one is for the gauge — they answer different questions.
-        pending_summary = self._client.xpending(
-            self._queue_name, self._group_name
-        )
-        PENDING_ENTRIES.labels(queue=self._queue_name).set(
-            pending_summary["pending"]
-        )
-
         return reclaimed
+
+    def _job_timeout(self, stream: str, entry_id: str) -> float | None:
+        """Look up the timeout_s of the job an entry points at."""
+        entries = self._client.xrange(stream, min=entry_id, max=entry_id, count=1)
+        if not entries:
+            return None
+        job_id = entries[0][1].get("job_id")
+        if not job_id:
+            return None
+        raw = self._client.hget(config.job_key(job_id), "timeout_s")
+        try:
+            return float(raw) if raw else None
+        except ValueError:
+            return None
+
+    def _reclaim_entry(
+        self, queue: str, entry_id: str, min_idle_ms: int, error: str, reason: str
+    ) -> bool:
+        """Claim one exact entry and fail its job.  True if we reclaimed it.
+
+        Why XCLAIM on the exact id, not XAUTOCLAIM?
+        XAUTOCLAIM(start=entry_id, count=1) claims the first idle entry *at
+        or after* entry_id, whoever owns it.  If entry_id was already
+        claimed by another monitor (its idle time just reset) or acked, it
+        silently claims the *next* idle entry instead — which can belong to
+        a live worker partway through a long job.  That job would then run
+        twice.  XCLAIM with MIN-IDLE-TIME on a single id either claims
+        exactly that entry, still idle, or returns nothing.  The idle check
+        is re-evaluated atomically inside Redis, which is what makes
+        concurrent monitors safe: whichever claims first resets the idle
+        time, so the other's XCLAIM finds it "not idle enough" and gets [].
+        """
+        stream = config.stream_key(queue)
+        claimed = self._client.xclaim(
+            stream,
+            self._group_name,
+            self._consumer_name,
+            min_idle_time=min_idle_ms,
+            message_ids=[entry_id],
+        )
+        if not claimed:
+            return False
+        claimed_id, fields = claimed[0]
+        job_id = (fields or {}).get("job_id")
+
+        if not job_id:
+            logger.warning("Reclaimed entry %s has no job_id; acking.", claimed_id)
+            self._client.xack(stream, self._group_name, claimed_id)
+            JOBS_SKIPPED.labels(queue=queue, reason="malformed").inc()
+            return False
+
+        raw = self._client.hgetall(config.job_key(job_id))
+        if not raw:
+            logger.warning("Job hash %s missing during reclaim; acking.", job_id)
+            self._client.xack(stream, self._group_name, claimed_id)
+            JOBS_SKIPPED.labels(queue=queue, reason="missing").inc()
+            return False
+
+        try:
+            job = Job.from_redis_hash(raw)
+        except (KeyError, ValueError, TypeError) as exc:
+            dead_letter_unreadable(
+                self._client,
+                job_id=job_id,
+                queue=queue,
+                entry_id=claimed_id,
+                group=self._group_name,
+                consumer=self._consumer_name,
+                error=f"corrupt job record: {format_error(exc)}",
+            )
+            return False
+
+        if job.status in TERMINAL_STATUSES:
+            # A stale duplicate entry for a job that already finished.
+            # Failing it would drag a COMPLETED job back to PENDING.
+            self._client.xack(stream, self._group_name, claimed_id)
+            JOBS_SKIPPED.labels(queue=queue, reason="terminal").inc()
+            return False
+
+        outcome = fail_job(
+            self._client,
+            job,
+            entry_id=claimed_id,
+            group=self._group_name,
+            consumer=self._consumer_name,
+            error=error,
+            trigger=reason,
+        )
+        if outcome is FailOutcome.LEASE_LOST:
+            return False
+        JOBS_RECLAIMED.labels(queue=queue, reason=reason).inc()
+        logger.info(
+            "Reclaimed job %s (%s): %s -> %s", job.id, reason, error, outcome.value
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # 2. Consumer garbage collection (+ live-worker discovery)
+    # ------------------------------------------------------------------
+
+    def collect_consumers(self, queue: str) -> set[str]:
+        """Delete long-idle dead consumers; return the live ones.
+
+        Every worker start gets a fresh random consumer name, so without
+        this the group's consumer list grows by one ghost per restart.
+        """
+        stream = config.stream_key(queue)
+        consumers, alive = live_consumers(self._client, queue, self._group_name)
+        for c in consumers:
+            name = c["name"]
+            if name in alive or int(c["pending"]) > 0:
+                continue
+            if int(c["idle"]) < self._consumer_gc_idle_ms:
+                continue
+            gc_keys = [stream, config.heartbeat_key(name)]
+            if int(_GC_CONSUMER(self._client, gc_keys, [self._group_name, name])):
+                logger.info("Removed idle dead consumer %s from %s", name, stream)
+        return alive
+
+    # ------------------------------------------------------------------
+    # 3. Stream trimming
+    # ------------------------------------------------------------------
+
+    def trim(self, queue: str) -> int:
+        """Drop stream entries that every consumer group is done with.
+
+        XACK does not delete anything from a stream, so without trimming
+        the stream holds every job ever enqueued, forever.
+
+        The safe cut point (XTRIM MINID keeps ids >= the cut) is the older of:
+          * just past the group's last-delivered-id — entries up to and
+            including it have been delivered; everything after has not;
+          * the oldest pending entry — delivered but not acked, and the
+            monitor may still need to XCLAIM it.
+        Every entry older than the cut has been delivered and acknowledged.
+
+        ``approximate=True`` (``MINID ~``) lets Redis drop only whole
+        radix-tree nodes, which is much cheaper; it may keep a few entries
+        older than the cut, never fewer — the safe direction.
+        """
+        stream = config.stream_key(queue)
+        groups = self._client.xinfo_groups(stream)
+        if not groups:
+            return 0
+        delivered = min(_parse_id(g["last-delivered-id"]) for g in groups)
+        if delivered == (0, 0):
+            return 0  # nothing has been delivered yet
+        # The smallest id strictly greater than last-delivered-id.
+        cut = (delivered[0], delivered[1] + 1)
+        for g in groups:
+            summary = self._client.xpending(stream, g["name"])
+            if summary["pending"] and summary["min"]:
+                cut = min(cut, _parse_id(summary["min"]))
+        return int(
+            self._client.xtrim(
+                stream, minid=f"{cut[0]}-{cut[1]}", approximate=self._approximate_trim
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Gauges
+    # ------------------------------------------------------------------
+
+    def _update_queue_gauges(self, queue: str) -> None:
+        stats = queue_stats(self._client, queue, self._group_name)
+        QUEUE_BACKLOG.labels(queue=queue).set(stats.backlog)
+        PENDING_ENTRIES.labels(queue=queue).set(stats.pending)
+        STREAM_LENGTH.labels(queue=queue).set(stats.stream_length)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     def run(self) -> None:
         """Loop calling tick() until the stop event is set.
 
-        Between ticks, we sleep for poll_interval_s using Event.wait()
-        so that stop_event.set() wakes us immediately instead of waiting
-        out the full interval.
-
-        No heartbeat thread is needed here.  The monitor doesn't hold jobs
-        in the PEL the way workers do — reclaimed entries are immediately
-        processed (XACK'd after retry/DLQ).  If the monitor dies, orphaned
-        jobs simply wait in the PEL a bit longer until it restarts.  There's
-        no data loss, just delayed reclamation.
+        No heartbeat is needed: entries the monitor claims are failed and
+        acked within the same tick.  If every monitor dies, orphaned jobs
+        wait in the PEL until one restarts — delayed, not lost.
         """
-        while not self._stop_event.is_set():
-            self.tick()
-            self._stop_event.wait(self._poll_interval_s)
+        run_until_stopped(self.tick, self._stop_event, self._poll_interval_s, "monitor")
