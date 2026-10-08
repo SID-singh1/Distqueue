@@ -1,0 +1,26 @@
+# The image needs only pyproject.toml, README.md and distqueue/.  Without
+# this file `COPY` sent the whole project as build context — including an
+# ~88 MB Windows virtualenv that is useless (and wrong) inside Linux.
+.git
+.github
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+coverage.xml
+tests
+chaos
+loadtest
+docs
+docker
+scripts
+*.md
+!README.md
+*.txt
+*.html
+.env

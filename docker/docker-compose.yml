@@ -1,10 +1,52 @@
-# docker-compose.yml — distqueue application stack.
+# docker-compose.yml — the full distqueue stack.
+#
+#   docker compose -f docker/docker-compose.yml --profile demo up --build -d
+#
+# Starts Redis, 3 workers, 2 schedulers, 1 monitor, a demo producer
+# (profile "demo"), Prometheus and Grafana.  Without --profile demo there is
+# no traffic: that's the mode the chaos tests and CI use, so their probe
+# jobs don't queue behind demo load.
+#
+# For local integration tests start ONLY Redis:
+#   docker compose -f docker/docker-compose.yml up -d redis
+
+name: distqueue
+
+# Shared settings for every distqueue role (YAML anchor, merged below).
+x-distqueue: &distqueue
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  image: distqueue:local
+  # Before: no restart policy, so a worker that crashed (e.g. on a Redis
+  # restart) stayed dead.  `unless-stopped` restarts crashed containers but
+  # respects a deliberate `docker compose stop`.
+  restart: unless-stopped
+  expose:
+    # expose (not ports): `--scale worker=N` can't bind N containers to one
+    # host port.  Prometheus reaches each replica on the Docker network.
+    - "9100"
+  depends_on:
+    redis:
+      condition: service_healthy
+
+x-env: &env
+  REDIS_HOST: redis
 
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
+    # AOF persistence: without it a Redis restart loses every queued job,
+    # the consumer group and the PEL — i.e. every in-flight job.
+    # appendfsync everysec bounds the loss window to ~1 s of writes; the
+    # stricter "always" would fsync on every command, which costs far more
+    # throughput than a 1 s window is worth for this workload.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
     ports:
       - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -12,71 +54,72 @@ services:
       retries: 5
 
   worker:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    command: python scripts/run_worker.py
-    # We use expose instead of ports because docker compose --scale worker=N 
-    # would fail if we bound multiple containers to the same host port. 
-    # 'expose' makes the port accessible only within the Docker network 
-    # (e.g., to Prometheus), allowing horizontal scaling without port conflicts.
-    expose:
-      - "9100"
+    <<: *distqueue
+    command: ["worker"]
+    deploy:
+      replicas: 3
+    # SIGTERM -> the worker finishes its current job, then exits.  Docker's
+    # default 10 s grace period would SIGKILL longer jobs mid-flight and
+    # turn every deploy into a burst of "dead worker" reclaims.
+    stop_grace_period: 30s
     environment:
-      - REDIS_HOST=redis
-      - DEMO_FAILURE_RATE=0.1
-    depends_on:
-      redis:
-        condition: service_healthy
+      <<: *env
+      DEMO_FAILURE_RATE: "0.1"
+      DEMO_PERMANENT_RATE: "0.01"
 
   scheduler:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    command: python scripts/run_scheduler.py
-    expose:
-      - "9100"
+    <<: *distqueue
+    command: ["scheduler"]
+    # Two replicas on purpose: the move script is gated on ZREM, so they
+    # can't double-inject a job.  High availability with no leader election.
+    deploy:
+      replicas: 2
     environment:
-      - REDIS_HOST=redis
-    depends_on:
-      redis:
-        condition: service_healthy
-    # Scheduler is single-replica by design
+      <<: *env
 
   monitor:
-    build:
-      context: ..
-      dockerfile: Dockerfile
-    command: python scripts/run_monitor.py
-    expose:
-      - "9100"
+    <<: *distqueue
+    command: ["monitor"]
     environment:
-      - REDIS_HOST=redis
-    depends_on:
-      redis:
-        condition: service_healthy
+      <<: *env
+
+  producer:
+    <<: *distqueue
+    command: ["produce", "--rate", "4"]
+    profiles: ["demo"]
+    environment:
+      <<: *env
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
       - "9090:9090"
+    restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.3.0
     ports:
-      # Fine to publish host port since there is only ever one Grafana instance
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
-      # Enabling anonymous access is fine for a local portfolio demo to avoid 
-      # constant logins, but this would never be done in production.
+      # Anonymous viewer access is convenient for a local demo; never do
+      # this in production.
       - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/distqueue.json
     volumes:
       - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
+    restart: unless-stopped
+
+volumes:
+  redis-data:

@@ -1,0 +1,89 @@
+# alerts.yml — Prometheus alerting rules for distqueue.
+#
+# Alerts are written against symptoms a user of the queue would feel
+# (jobs waiting too long, jobs being lost to the DLQ, nobody processing)
+# plus the few internal signals that predict those symptoms.  View them at
+# http://localhost:9090/alerts.  (No Alertmanager is wired up: routing
+# notifications to Slack/PagerDuty is deployment-specific.)
+#
+# Queue-state gauges are published by the monitor; `max by (queue)` keeps
+# the expressions correct if more than one monitor replica is running.
+
+groups:
+  - name: distqueue
+    rules:
+      # The queue's SLI: how long jobs wait before a worker starts them.
+      - alert: DistqueueQueueWaitHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, queue) (rate(distqueue_job_queue_wait_seconds_bucket[5m]))
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 queue wait on {{ $labels.queue }} is {{ $value | humanizeDuration }}"
+          description: >-
+            Jobs are waiting more than 30 s for a worker.  Workers can't keep
+            up with the arrival rate: scale workers out or find the slow handler.
+
+      # Backlog that keeps growing will never drain on its own.
+      - alert: DistqueueBacklogGrowing
+        expr: |
+          max by (queue) (distqueue_queue_backlog) > 100
+          and
+          deriv(max by (queue) (distqueue_queue_backlog)[10m:1m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backlog on {{ $labels.queue }} is {{ $value }} and still growing"
+
+      - alert: DistqueueNoLiveWorkers
+        expr: |
+          max(distqueue_live_workers) == 0
+          and
+          sum(max by (queue) (distqueue_queue_backlog)) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Jobs are queued but no worker has a live heartbeat"
+
+      # Every DLQ entry is a job that will not complete without a human.
+      - alert: DistqueueJobsDeadLettered
+        expr: sum by (queue) (increase(distqueue_jobs_failed_total{outcome="dlq"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanize }} job(s) on {{ $labels.queue }} dead-lettered in 15 m"
+          description: "Inspect with `distqueue dlq list`; replay with `distqueue dlq replay`."
+
+      # Fenced writes mean workers are outliving their heartbeat (GC pauses,
+      # CPU starvation, a TTL that's too short) — and therefore jobs are
+      # being run twice.  Occasional is fine; sustained is not.
+      - alert: DistqueueLeaseLost
+        expr: sum(increase(distqueue_lease_lost_total[15m])) > 5
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanize }} stale worker writes rejected in 15 m"
+          description: >-
+            Workers are losing jobs to the monitor while still running them.
+            Check for CPU starvation or long pauses, or raise HEARTBEAT_TTL_S.
+
+      - alert: DistqueueRedisErrors
+        expr: sum by (component) (rate(distqueue_redis_errors_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.component }} is retrying Redis errors"
+
+      - alert: DistqueueComponentDown
+        expr: up{job=~"distqueue_(worker|scheduler|monitor)"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }} is down"
