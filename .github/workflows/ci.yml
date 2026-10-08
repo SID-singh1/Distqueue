@@ -1,0 +1,122 @@
+# ci.yml — lint, test, build, and chaos-test distqueue on every push and PR.
+#
+# Jobs run in parallel where they can; the chaos job needs a built image and
+# a passing test suite, so it runs last.  Each job is what you'd run locally:
+#   lint    ruff check . && ruff format --check .
+#   test    pytest (unit + integration) against a real Redis service
+#   config  promtool validates prometheus.yml and the alert rules
+#   docker  the image builds and the CLI runs inside it
+#   chaos   the full stack survives a SIGKILLed and a frozen worker
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch cancels the older run instead of queuing
+# behind it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "ruff>=0.6"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported (requires-python) and newest.
+        python-version: ["3.11", "3.13"]
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Locally, integration tests skip when Redis is missing; in CI a
+      # missing Redis must fail the build, not silently skip half the suite.
+      DISTQUEUE_REQUIRE_REDIS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest -v --cov --cov-report=term-missing --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.13'
+        with:
+          name: coverage
+          path: coverage.xml
+
+  config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Prometheus config and alert rules
+        run: >-
+          docker run --rm -v "$PWD/docker:/etc/prometheus:ro"
+          --entrypoint promtool prom/prometheus:v2.55.1
+          check config /etc/prometheus/prometheus.yml
+      - name: Validate Grafana dashboard JSON
+        run: python -m json.tool docker/grafana/dashboards/distqueue.json > /dev/null
+      - name: Validate compose file
+        run: docker compose -f docker/docker-compose.yml config --quiet
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t distqueue:ci .
+      - name: CLI runs inside the image as a non-root user
+        run: |
+          docker run --rm distqueue:ci --help
+          test "$(docker run --rm --entrypoint id distqueue:ci -u)" != "0"
+
+  chaos:
+    needs: [test, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e ".[chaos]"
+      - name: Start the stack (no demo producer)
+        run: docker compose -f docker/docker-compose.yml up -d --build --wait redis worker scheduler monitor
+      - name: SIGKILL a worker mid-job
+        run: python -m chaos.kill_worker --json-out chaos-kill.json
+      - name: Freeze a worker past its heartbeat TTL (fencing)
+        run: python -m chaos.pause_worker --json-out chaos-pause.json
+      - name: Stack logs
+        if: failure()
+        run: docker compose -f docker/docker-compose.yml logs --no-color --tail 300
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: chaos-results
+          path: chaos-*.json
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v
