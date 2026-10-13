@@ -57,60 +57,80 @@ Two goals, equally important:
 ## Architecture (do not deviate without discussion)
 
 ```
-Producer(s) → Redis Stream (queue) → Consumer Group ("workers")
-                    ↑                        ↓ (PEL: pending entries list)
-              Delayed ZSet ←─ retry/backoff ─┘
-                    ↓ (scheduler polls, re-injects when due)
-              DLQ Stream (after max_attempts)
+Producer(s) → Redis Stream per queue → Consumer Group ("workers")
+   │ delay/run_at        ↑                     ↓ (PEL: pending entries list = lease table)
+   └──→ Delayed ZSet ←─ retry/backoff ─────────┘
+              ↓ (scheduler replicas poll, ZREM-gated re-inject into the job's own queue)
+        DLQ Stream (after max_attempts, or PermanentError)
 
-Heartbeat keys (per worker, TTL) → Monitor process → detects dead worker →
-    XAUTOCLAIM job from dead consumer → increment attempts → re-inject or DLQ
+Heartbeat keys (per worker, TTL) → Monitor → owner dead, or job past timeout_s →
+    XCLAIM that exact entry → FAIL transition (attempts++) → retry or DLQ
 ```
+
+Every job state change is ONE Lua script in `distqueue/transitions.py`
+(ENQUEUE, START, COMPLETE, FAIL, MOVE_DUE, REPLAY). Worker-side writes are
+fenced: they check `XPENDING ... <consumer>` ownership inside the script and
+are rejected if the monitor has reclaimed the entry. See `docs/design.md`.
 
 ### Redis data model
 
 | Key | Type | Purpose |
 |---|---|---|
-| `jobs:stream:{queue}` | Stream | main queue; consumer group `workers` reads from it |
-| `job:{id}` | Hash | `payload, status, attempts, max_attempts, created_at, updated_at, next_retry_at, last_worker, last_error` |
-| `jobs:delayed` | ZSet | score = `next_retry_at` epoch, member = `job_id` |
-| `jobs:dlq` | Stream | permanently failed jobs, same shape as main stream + failure metadata |
-| `worker:{id}:heartbeat` | String w/ TTL | refreshed periodically by each worker |
+| `jobs:stream:{queue}` | Stream | per-queue work stream; entry = `{job_id}` only; group `workers` |
+| `job:{id}` | Hash | `id, queue, payload, status, attempts, max_attempts, timeout_s, created_at, updated_at, next_retry_at, last_worker, last_error` |
+| `jobs:delayed` | ZSet | retries + scheduled jobs; score = due time (Redis `TIME`), member = `job_id` |
+| `jobs:dlq` | Stream | `job_id, queue, reason, attempts, trigger, failed_at` |
+| `jobs:queues` | Set | registry of queue names |
+| `worker:{id}:heartbeat` | String w/ TTL | refreshed by each worker's heartbeat thread |
+| `idem:{key}` | String w/ TTL | idempotency key → job_id |
 
 ### Job state machine
 
 ```
-PENDING → CLAIMED (in PEL) → RUNNING
-RUNNING → success → XACK → COMPLETED
-RUNNING → exception → attempts++ →
-     attempts < max_attempts → scheduled in jobs:delayed with backoff → PENDING (later)
-     attempts >= max_attempts → moved to jobs:dlq → DEAD
-CLAIMED/RUNNING → worker dies (heartbeat expires) → monitor XAUTOCLAIMs job →
-     attempts++ → same fork as above
+enqueue → PENDING (stream, or delayed set if scheduled)
+PENDING → START (owner check, skip if COMPLETED/DEAD) → RUNNING
+RUNNING → success → COMPLETE (owner check, XACK, TTL) → COMPLETED
+RUNNING → exception → FAIL (owner + attempts check) → attempts++ →
+     attempts < max_attempts → jobs:delayed with backoff → PENDING (later)
+     attempts >= max_attempts or PermanentError → jobs:dlq → DEAD
+RUNNING → worker dies (heartbeat expires) or exceeds timeout_s →
+     monitor XCLAIMs the entry → same FAIL fork (a lost attempt is an attempt)
+DEAD → `distqueue dlq replay` → PENDING (attempts reset)
 ```
 
-Backoff formula: `delay = min(base * 2**attempts + jitter, max_delay)`.
+There is no CLAIMED status: the PEL is the record of who holds what.
+
+Backoff formula ("equal jitter", see `distqueue/backoff.py`):
+`d = min(max_delay, base * 2**attempts); delay = uniform(d/2, d)`.
 Jitter is required, not optional — without it, jobs that fail together
 retry in lockstep and recreate the load spike that caused the failure.
+(The original `min(base * 2**attempts + jitter, max_delay)` discarded the
+jitter once the cap was reached, so capped retries ran in lockstep.)
 
-## Repo structure (target — build toward this, don't jump ahead)
+## Repo structure (current)
 
 ```
 distqueue/
 ├── distqueue/
-│   ├── job.py            # Job dataclass, serialization
-│   ├── client.py          # Redis connection wrapper
-│   ├── producer.py        # enqueue()
-│   ├── worker.py           # consume loop, heartbeat emit, ack/nack
-│   ├── scheduler.py       # polls delayed ZSet, re-injects due jobs
-│   ├── monitor.py          # heartbeat reaper, XAUTOCLAIM dead-worker jobs
-│   ├── config.py          # backoff params, timeouts, queue names
-│   └── metrics.py         # prometheus_client instrumentation
+│   ├── transitions.py    # the state machine: every transition as one fenced Lua script
+│   ├── job.py            # Job dataclass, JobStatus, serialization
+│   ├── client.py         # Redis connection (timeouts, no client auto-retry)
+│   ├── producer.py       # enqueue(): queues, delay/run_at, idempotency keys
+│   ├── worker.py         # consume loop, heartbeat thread, self-fencing
+│   ├── scheduler.py      # delayed ZSet -> stream, replica-safe
+│   ├── monitor.py        # XCLAIM dead/timed-out jobs, trim, consumer GC, gauges
+│   ├── backoff.py        # equal-jitter backoff (pure, unit-tested)
+│   ├── runloop.py        # shared tick loop that survives Redis errors
+│   ├── stats.py          # queue stats for the monitor and the CLI
+│   ├── metrics.py        # prometheus_client instrumentation
+│   ├── config.py         # env-overridable settings + key layout
+│   ├── cli.py / entrypoints.py / demo.py / errors.py
 ├── tests/{unit,integration}/
-├── chaos/kill_worker.py
-├── loadtest/locustfile.py
-├── docker/{docker-compose.yml, Dockerfile, prometheus.yml}
-├── grafana/dashboards/queue.json
+├── chaos/{kill_worker.py, pause_worker.py}
+├── loadtest/benchmark.py     # stdlib harness (replaced the planned locustfile)
+├── docker/{docker-compose.yml, prometheus.yml, alerts.yml, grafana/}
+├── Dockerfile, .dockerignore
+├── docs/{design.md, benchmarks.md, images/}
 └── .github/workflows/ci.yml
 ```
 
