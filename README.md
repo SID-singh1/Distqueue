@@ -110,22 +110,24 @@ docker kill distqueue-worker-2                                       # job recla
 ```python
 from distqueue import PermanentError, Worker, enqueue, get_redis_client
 
-client = get_redis_client()          # REDIS_URL or REDIS_HOST/PORT/DB
+client = get_redis_client()  # REDIS_URL or REDIS_HOST/PORT/DB
 
 job_id = enqueue(
     client,
     {"to": "ada@example.com", "template": "welcome"},
     queue="emails",
     max_attempts=5,
-    timeout_s=30,                    # reclaimed if it runs longer
-    delay_s=60,                      # or run_at=<epoch>
-    idempotency_key="signup-4711",   # a retried enqueue won't duplicate it
+    timeout_s=30,  # reclaimed if it runs longer
+    delay_s=60,  # or run_at=<epoch>
+    idempotency_key="signup-4711",  # a retried enqueue won't duplicate it
 )
+
 
 def send_email(payload: dict) -> None:
     if "@" not in payload["to"]:
-        raise PermanentError("invalid address")   # straight to the DLQ, no retries
-    ...                                           # any other exception = retry with backoff
+        raise PermanentError("invalid address")  # straight to the DLQ, no retries
+    ...  # any other exception = retry with backoff
+
 
 Worker(client, send_email, queue="emails").run()
 ```
